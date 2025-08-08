@@ -174,7 +174,7 @@ app.get('/readyz', async (_req, reply) => {
   }
 });
 
-app.get('/webhook', async (req, reply) => {
+app.get('/', async (req, reply) => {
   const { mode, challenge, 'verify_token': verifyToken } = req.query || {};
   if (mode === 'subscribe' && verifyToken === META_VERIFY_TOKEN) {
     return reply.type('text/plain').send(challenge ?? '');
@@ -182,7 +182,7 @@ app.get('/webhook', async (req, reply) => {
   return reply.code(403).send({ error: 'verification failed' });
 });
 
-app.post('/webhook', async (req, reply) => {
+app.post('/', async (req, reply) => {
   const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody || JSON.stringify(req.body || {}));
   const headers = req.headers || {};
   const channel = detectChannel(req.body, headers);
