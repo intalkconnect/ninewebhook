@@ -1,0 +1,16 @@
+{
+  "name": "webhook-router-fastify-cjs",
+  "version": "1.0.0",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.3",
+    "fastify": "^4.28.1",
+    "fastify-raw-body": "^5.0.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.11.5"
+  }
+}
