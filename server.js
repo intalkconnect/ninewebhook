@@ -174,7 +174,7 @@ app.get('/readyz', async (_req, reply) => {
   }
 });
 
-app.get('/', async (req, reply) => {
+app.get('/webhook', async (req, reply) => {
   const { 'hub.mode': hubMode, 'hub.challenge': hubChallenge, 'hub.verify_token': hubVerifyToken, hub_mode, hub_challenge, hub_verify_token } = req.query || {};
 const mode = hubMode || hub_mode;
 const challenge = hubChallenge || hub_challenge;
@@ -186,7 +186,7 @@ const verifyToken = hubVerifyToken || hub_verify_token;
   return reply.code(403).send({ error: 'verification failed' });
 });
 
-app.post('/', async (req, reply) => {
+app.post('/webhook', async (req, reply) => {
   const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody || JSON.stringify(req.body || {}));
   const headers = req.headers || {};
   const channel = detectChannel(req.body, headers);
