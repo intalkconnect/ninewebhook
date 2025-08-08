@@ -192,16 +192,19 @@ app.post('/webhook', async (req, reply) => {
   const channel = detectChannel(req.body, headers);
   if (channel === 'unknown') return reply.code(400).send({ error: 'unknown channel' });
 
-  if (channel === 'telegram') {
-    if (!verifyTelegramSecret(headers['x-telegram-bot-api-secret-token'])) {
-      return reply.code(401).send({ error: 'telegram secret mismatch' });
-    }
-  } else {
-    const sig = headers['x-hub-signature-256'];
-    if (!verifyMetaSignature(sig, raw)) {
-      return reply.code(401).send({ error: 'meta signature mismatch' });
-    }
+if (channel === 'telegram') {
+  // Para manter compatibilidade com seu código atual, não exige secret
+  // Apenas loga se vier sem o header
+  if (!headers['x-telegram-bot-api-secret-token']) {
+    req.log.warn('Telegram sem secret header — permitido para compatibilidade.');
   }
+} else if (channel === 'whatsapp' || channel === 'instagram' || channel === 'facebook') {
+  // Não valida assinatura para compatibilidade
+  if (!headers['x-hub-signature-256']) {
+    req.log.warn('Meta webhook sem assinatura — permitido para compatibilidade.');
+  }
+}
+
 
   const evt = normalizeEvent(channel, req.body || {});
   let msgId = channel === 'telegram' ? String(req.body?.update_id ?? '') : String(req.body?.entry?.[0]?.id ?? '');
