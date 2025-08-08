@@ -175,7 +175,11 @@ app.get('/readyz', async (_req, reply) => {
 });
 
 app.get('/webhook', async (req, reply) => {
-  const { mode, challenge, 'verify_token': verifyToken } = req.query || {};
+  const { 'hub.mode': hubMode, 'hub.challenge': hubChallenge, 'hub.verify_token': hubVerifyToken, hub_mode, hub_challenge, hub_verify_token } = req.query || {};
+const mode = hubMode || hub_mode;
+const challenge = hubChallenge || hub_challenge;
+const verifyToken = hubVerifyToken || hub_verify_token;
+
   if (mode === 'subscribe' && verifyToken === META_VERIFY_TOKEN) {
     return reply.type('text/plain').send(challenge ?? '');
   }
