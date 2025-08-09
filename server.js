@@ -166,15 +166,33 @@ async function getConfirmChannel(amqpUrl) {
 async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) {
   const ch = await getConfirmChannel(amqpUrl || DEFAULT_AMQP_URL);
   const payload = Buffer.from(JSON.stringify(body));
+
   let ex = exchange || '';
   let rk = routingKey || '';
   if (queue && !exchange) {
     ex = '';
     rk = queue;
   }
+
+  console.log(`📤 Enviando para RabbitMQ:
+    Exchange: ${ex || '(default)'}
+    Routing Key: ${rk}
+    Queue: ${queue || '(nenhuma direta)'}
+    Headers: ${JSON.stringify(headers)}
+    Payload: ${payload.toString()}
+  `);
+
   const ok = ch.publish(ex, rk, payload, { persistent: true, headers, contentType: 'application/json' });
-  if (!ok) await new Promise(res => ch.once('drain', res));
+
+  if (!ok) {
+    console.warn('⚠️ Buffer cheio, aguardando RabbitMQ liberar...');
+    await new Promise(res => ch.once('drain', res));
+  }
+
   await ch.waitForConfirms();
+  console.log('✅ Mensagem confirmada pelo RabbitMQ!');
+}
+await ch.waitForConfirms();
 }
 
 // ====== Fastify app ======
