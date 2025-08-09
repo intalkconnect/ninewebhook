@@ -192,8 +192,6 @@ async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) 
   await ch.waitForConfirms();
   console.log('✅ Mensagem confirmada pelo RabbitMQ!');
 }
-await ch.waitForConfirms();
-}
 
 // ====== Fastify app ======
 const app = Fastify({ logger: true, bodyLimit: 2*1024*1024 });
