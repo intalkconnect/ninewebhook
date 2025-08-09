@@ -1,6 +1,6 @@
 // server.js — Webhook único (Fastify) em CommonJS (require)
 // Canais: WhatsApp, Instagram, Facebook (Meta) e Telegram
-// Objetivo: máximo de logs para rastrear recepção -> roteamento -> publicação RabbitMQ
+// Logs verbosos + idempotência por mensagem (wamid) + publicação RabbitMQ
 
 'use strict';
 
@@ -46,11 +46,15 @@ const nowIso = () => new Date().toISOString();
 const safeJson = (obj) => {
   try { return JSON.stringify(obj, null, 2); } catch { return '[unserializable]'; }
 };
+const redactUrl = (str) => {
+  if (!str) return str;
+  return String(str).replace(/(\/\/[^:]+:)([^@]+)(@)/, '$1***$3'); // amqp://user:***@host/...
+};
 
 // ============ Helpers ============
 function detectChannel(body, headers) {
   const lh = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
-  if ('x-hub-signature-256' in lh) {
+  if ('x-hub-signature-256' in lh || 'x-hub-signature' in lh) {
     const obj = body?.object;
     if (obj === 'whatsapp_business_account') return 'whatsapp';
     if (obj === 'instagram') return 'instagram';
@@ -60,10 +64,10 @@ function detectChannel(body, headers) {
   return 'unknown';
 }
 
-function verifyMetaSignature(sigHeader, raw) {
-  if (!META_APP_SECRET) return true; // modo dev/compat
-  if (!sigHeader || !String(sigHeader).startsWith('sha256=')) return false;
-  const received = String(sigHeader).split('=')[1];
+function verifyMetaSignature(sigHeader256, raw) {
+  if (!META_APP_SECRET) return true; // modo compat
+  if (!sigHeader256 || !String(sigHeader256).startsWith('sha256=')) return false;
+  const received = String(sigHeader256).split('=')[1];
   const expected = crypto.createHmac('sha256', META_APP_SECRET).update(raw).digest('hex');
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(received));
@@ -73,7 +77,7 @@ function verifyMetaSignature(sigHeader, raw) {
 }
 
 function verifyTelegramSecret(tokenHeader) {
-  if (!TELEGRAM_SECRET) return true; // modo dev/compat
+  if (!TELEGRAM_SECRET) return true; // modo compat
   return tokenHeader === TELEGRAM_SECRET;
 }
 
@@ -86,14 +90,10 @@ function extractExternalIds(channel, body) {
       };
     }
     if (channel === 'instagram' || channel === 'facebook') {
-      return {
-        wabaId: String(body?.entry?.[0]?.id ?? '') || null
-      };
+      return { wabaId: String(body?.entry?.[0]?.id ?? '') || null };
     }
     if (channel === 'telegram') {
-      return {
-        wabaId: TELEGRAM_ENDPOINT_ID || null
-      };
+      return { wabaId: TELEGRAM_ENDPOINT_ID || null };
     }
     return {};
   } catch (e) {
@@ -109,10 +109,10 @@ function normalizeEvent(channel, body) {
   const evt = {
     channel,
     received_at: now,
-    tenant_id: ids.wabaId || null, // WABA ID define o tenant (ou null)
+    tenant_id: ids.wabaId || null,      // WABA ID define o tenant
     event_type: 'message.received',
     aggregate_id: null,
-    external_id: ids.phoneNumberId || ids.wabaId || null, // número ou fallback p/ WABA
+    external_id: ids.phoneNumberId || ids.wabaId || null,
     payload: body
   };
 
@@ -135,6 +135,42 @@ function normalizeEvent(channel, body) {
   }
 
   return evt;
+}
+
+// Chave de idempotência — preferir IDs únicos por mensagem/evento
+function computeIdempotencyKey(channel, body, raw) {
+  try {
+    if (channel === 'whatsapp') {
+      const change = body?.entry?.[0]?.changes?.[0]?.value;
+      const msgId = change?.messages?.[0]?.id              // wamid da mensagem
+                 || change?.statuses?.[0]?.id;             // id de status (entrega/leitura)
+      if (msgId) {
+        console.log(`🧩 Idempotency (WhatsApp): usando ${msgId}`);
+        return `wa:${msgId}`;
+      }
+    } else if (channel === 'instagram' || channel === 'facebook') {
+      const messaging = body?.entry?.[0]?.messaging?.[0];
+      const mid = messaging?.message?.mid
+               || messaging?.delivery?.mids?.[0]
+               || messaging?.postback?.mid
+               || messaging?.timestamp; // fallback (não perfeito, mas melhor que WABA id)
+      if (mid) {
+        console.log(`🧩 Idempotency (Meta IG/FB): usando ${mid}`);
+        return `meta:${mid}`;
+      }
+    } else if (channel === 'telegram') {
+      const up = body?.update_id;
+      if (up != null) {
+        console.log(`🧩 Idempotency (Telegram): usando update_id=${up}`);
+        return `tg:${String(up)}`;
+      }
+    }
+  } catch (e) {
+    console.warn('computeIdempotencyKey erro:', e?.message);
+  }
+  const fallback = `raw:${crypto.createHash('sha1').update(raw).digest('hex')}`;
+  console.log(`🧩 Idempotency (fallback): usando ${fallback}`);
+  return fallback;
 }
 
 // Cache endpoint -> route
@@ -213,7 +249,7 @@ async function getConfirmChannel(amqpUrl) {
   if (existing?.ch && !existing.ch.connectionClosed) {
     return existing.ch;
   }
-  console.log(`📡 [${nowIso()}] Conectando ao RabbitMQ: ${url}`);
+  console.log(`📡 [${nowIso()}] Conectando ao RabbitMQ: ${redactUrl(url)} | host=${process.env.AMQP_HOST || '-'} vhost=${process.env.AMQP_VHOST || '-'} user=${process.env.AMQP_USER || '-'}`);
   const conn = await amqplib.connect(url, { heartbeat: 15 });
   const ch = await conn.createConfirmChannel();
   ch.on('error', (e) => console.error('[amqp ch error]', e));
@@ -222,9 +258,7 @@ async function getConfirmChannel(amqpUrl) {
   conn.on('close', () => {
     console.warn('[amqp conn closed]', url);
     const item = pools.get(url);
-    if (item) {
-      item.ch.connectionClosed = true;
-    }
+    if (item) item.ch.connectionClosed = true;
   });
   pools.set(url, { conn, ch });
   return ch;
@@ -290,7 +324,6 @@ app.get('/readyz', async (_req, reply) => {
     await pool.query('SELECT 1');
     try { await redis.ping(); } catch (e) {
       console.warn('Redis ping falhou em /readyz:', e?.message);
-      // ainda consideramos "not ready"
       throw e;
     }
     const conn = await amqplib.connect(DEFAULT_AMQP_URL, { heartbeat: 10 });
@@ -351,7 +384,7 @@ app.post('/webhook', async (req, reply) => {
     return reply.code(400).send({ error: 'unknown channel' });
   }
 
-  // Validações (permissivas para compatibilidade, mas logamos)
+  // Validações (permissivas para facilitar teste)
   if (channel === 'telegram') {
     const ok = verifyTelegramSecret(headers['x-telegram-bot-api-secret-token']);
     if (!ok) {
@@ -363,10 +396,9 @@ app.post('/webhook', async (req, reply) => {
   } else { // Meta
     const ok = verifyMetaSignature(headers['x-hub-signature-256'], raw);
     if (!ok) {
-      console.warn('❌ Meta assinatura inválida');
-      // Para compat: NÃO bloqueia se quiser, mas aqui vamos bloquear para segurança:
+      console.warn('❌ Meta assinatura inválida (modo permissivo — seguindo).');
+      // Se quiser BLOQUEAR quando inválida, descomente a linha abaixo:
       // return reply.code(401).send({ error: 'meta signature invalid' });
-      // Se preferir compat, comente a linha acima e use o warn.
     } else if (!META_APP_SECRET) {
       console.warn('⚠️ META_APP_SECRET vazio — validação skip (modo compat)');
     }
@@ -375,31 +407,23 @@ app.post('/webhook', async (req, reply) => {
   const evt = normalizeEvent(channel, req.body || {});
   console.log('📦 Evento normalizado:', safeJson(evt));
 
-  // Geração do idempotency key
-  let msgId;
-  try {
-    msgId = (channel === 'telegram')
-      ? String(req.body?.update_id ?? '')
-      : String(req.body?.entry?.[0]?.id ?? '');
-  } catch {
-    msgId = '';
-  }
-  if (!msgId || msgId === 'undefined') {
-    msgId = crypto.createHash('sha1').update(raw).digest('hex');
-  }
+  // Chave de idempotência por mensagem/evento
+  const msgId = computeIdempotencyKey(channel, req.body || {}, raw);
   console.log(`🔑 Idempotency Key: ${msgId}`);
 
   // Checagem idempotência
+  let wrote;
   try {
     const idemKey = `idem:${msgId}`;
-    const hit = await redis.set(idemKey, '1', 'EX', 300, 'NX');
-    console.log(`💾 Redis SET ${idemKey} => ${hit}`);
-    if (hit !== 'OK') {
-      console.log('♻️ Evento duplicado — retornando duplicate');
-      return reply.send({ status: 'duplicate' });
-    }
+    wrote = await redis.set(idemKey, '1', 'EX', 300, 'NX');
+    console.log(`💾 Redis SET ${idemKey} => ${wrote}`);
   } catch (e) {
     console.error('Redis SET falhou — seguindo mesmo assim:', e?.message);
+  }
+
+  if (wrote !== 'OK') {
+    console.log('♻️ Evento duplicado — retornando duplicate');
+    return reply.send({ status: 'duplicate' });
   }
 
   console.log('📍 Resolvendo rota...');
@@ -429,7 +453,6 @@ app.post('/webhook', async (req, reply) => {
     console.log('✅ Publicação concluída');
   } catch (e) {
     console.error('❌ Erro ao publicar no RabbitMQ:', e);
-    // Opcional: enviar p/ uma fila de “estacionamento”/DLQ se quiser.
     return reply.code(202).send({ status: 'accepted_parking' });
   }
 
@@ -441,15 +464,15 @@ app.post('/webhook', async (req, reply) => {
 (async () => {
   console.log('🌐 Boot iniciando...', nowIso());
 
-  // Tenta conectar Redis de forma antecipada (para falhar cedo se necessário)
+  // Conecta Redis (fail fast + retry interno)
   try {
     await redis.connect();
     console.log('✅ Redis conectado');
   } catch (e) {
-    console.warn('⚠️ Redis não conectou ainda (tentará retry automático):', e?.message);
+    console.warn('⚠️ Redis não conectou ainda (retry automático):', e?.message);
   }
 
-  // Teste rápido de Postgres (não bloqueante)
+  // Teste rápido de Postgres
   try {
     await pool.query('SELECT 1');
     console.log('✅ Postgres OK');
@@ -475,7 +498,7 @@ async function shutdown(reason) {
   for (const [url, obj] of pools.entries()) {
     try { await obj?.ch?.close(); } catch {}
     try { await obj?.conn?.close(); } catch {}
-    console.log('AMQP fechado:', url);
+    console.log('AMQP fechado:', redactUrl(url));
   }
   console.log('✅ Shutdown concluído');
   process.exit(0);
