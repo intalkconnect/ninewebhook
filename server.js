@@ -1,6 +1,7 @@
 // server.js — Webhook único (Fastify) em CommonJS (require)
 // Canais: WhatsApp, Instagram, Facebook (Meta) e Telegram
-// Logs verbosos + idempotência por mensagem (wamid) + publicação RabbitMQ
+// Usa channel_endpoints (channel, external_id, cluster_id, queue) + clusters(amqp_url)
+// Publica direto em fila (default exchange)
 
 'use strict';
 
@@ -13,45 +14,51 @@ const Redis = require('ioredis');
 
 // ============ ENV ============
 const PORT = Number(process.env.PORT) || 3000;
-const META_APP_SECRET = process.env.META_APP_SECRET || '';
+
+// Meta/Telegram (validação opcional — permissiva)
+const META_APP_SECRET   = process.env.META_APP_SECRET   || '';
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
-const TELEGRAM_SECRET = process.env.TELEGRAM_SECRET || '';
+const TELEGRAM_SECRET   = process.env.TELEGRAM_SECRET   || '';
 const TELEGRAM_ENDPOINT_ID = process.env.TELEGRAM_ENDPOINT_ID || '';
 
-// Postgres externo
+// Redis
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = Number(process.env.REDIS_PORT || 6379);
+
+// Rabbit fallback
+const DEFAULT_AMQP_URL = process.env.DEFAULT_AMQP_URL || 'amqp://guest:guest@localhost:5672/';
+const INCOMING_QUEUE   = process.env.INCOMING_QUEUE   || ''; // se setado, usa SEMPRE esta fila
+const INCOMING_PREFIX  = process.env.INCOMING_PREFIX  || ''; // se setado, usa <prefix>.<clientId>
+
+// Postgres (para resolver fila por channel_endpoints)
+const {
+  PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+} = process.env;
+
 const { Pool } = pg;
 const pool = new Pool({
-  host: process.env.PGHOST,
-  port: Number(process.env.PGPORT) || 5432,
-  database: process.env.PGDATABASE,
-  user: process.env.PGUSER,
-  password: process.env.PGPASSWORD,
+  host: PGHOST,
+  port: Number(PGPORT || 5432),
+  database: PGDATABASE,
+  user: PGUSER,
+  password: PGPASSWORD,
   max: 10,
   idleTimeoutMillis: 10000
 });
 
-// Redis interno
 const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: Number(process.env.REDIS_PORT) || 6379,
+  host: REDIS_HOST,
+  port: REDIS_PORT,
   lazyConnect: true,
   retryStrategy: (times) => Math.min(times * 50, 2000)
 });
 
-// Rabbit interno (URL default)
-const DEFAULT_AMQP_URL = process.env.DEFAULT_AMQP_URL || 'amqp://guest:guest@localhost:5672/';
-
 // ============ Utils ============
 const nowIso = () => new Date().toISOString();
-const safeJson = (obj) => {
-  try { return JSON.stringify(obj, null, 2); } catch { return '[unserializable]'; }
-};
-const redactUrl = (str) => {
-  if (!str) return str;
-  return String(str).replace(/(\/\/[^:]+:)([^@]+)(@)/, '$1***$3'); // amqp://user:***@host/...
-};
+const safe = (o) => { try { return JSON.stringify(o, null, 2); } catch { return '[unserializable]'; } };
+const redact = (url) => String(url || '').replace(/(\/\/[^:]+:)([^@]+)(@)/, '$1***$3');
 
-// ============ Helpers ============
+// ============ Canal & IDs ============
 function detectChannel(body, headers) {
   const lh = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
   if ('x-hub-signature-256' in lh || 'x-hub-signature' in lh) {
@@ -64,63 +71,67 @@ function detectChannel(body, headers) {
   return 'unknown';
 }
 
-function verifyMetaSignature(sigHeader256, raw) {
-  if (!META_APP_SECRET) return true; // modo compat
-  if (!sigHeader256 || !String(sigHeader256).startsWith('sha256=')) return false;
-  const received = String(sigHeader256).split('=')[1];
+function verifyMetaSignature(sig256, raw) {
+  if (!META_APP_SECRET) return true; // permissivo em dev
+  if (!sig256 || !String(sig256).startsWith('sha256=')) return false;
+  const received = String(sig256).split('=')[1];
   const expected = crypto.createHmac('sha256', META_APP_SECRET).update(raw).digest('hex');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(received));
-  } catch {
-    return false;
-  }
+  try { return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(received)); }
+  catch { return false; }
 }
 
-function verifyTelegramSecret(tokenHeader) {
-  if (!TELEGRAM_SECRET) return true; // modo compat
-  return tokenHeader === TELEGRAM_SECRET;
-}
-
-function extractExternalIds(channel, body) {
+function extractClientId(channel, body) {
   try {
     if (channel === 'whatsapp') {
-      return {
-        wabaId: body?.entry?.[0]?.id || null,
-        phoneNumberId: body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id || null
-      };
+      // melhor clientId = phone_number_id
+      const pnid = body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+      return pnid || (body?.entry?.[0]?.id || null);
     }
     if (channel === 'instagram' || channel === 'facebook') {
-      return { wabaId: String(body?.entry?.[0]?.id ?? '') || null };
+      return String(body?.entry?.[0]?.id ?? '') || null;
     }
     if (channel === 'telegram') {
-      return { wabaId: TELEGRAM_ENDPOINT_ID || null };
+      return TELEGRAM_ENDPOINT_ID || null; // 1 endpoint por bot
     }
-    return {};
-  } catch (e) {
-    console.error('extractExternalIds erro:', e);
-    return {};
-  }
+  } catch {}
+  return null;
+}
+
+function computeIdempotencyKey(channel, body, raw) {
+  try {
+    if (channel === 'whatsapp') {
+      const chg = body?.entry?.[0]?.changes?.[0]?.value;
+      const mid = chg?.messages?.[0]?.id || chg?.statuses?.[0]?.id;
+      if (mid) return `wa:${mid}`;
+    }
+    if (channel === 'instagram' || channel === 'facebook') {
+      const msg = body?.entry?.[0]?.messaging?.[0];
+      const mid = msg?.message?.mid || msg?.delivery?.mids?.[0] || msg?.timestamp;
+      if (mid) return `meta:${mid}`;
+    }
+    if (channel === 'telegram') {
+      const up = body?.update_id;
+      if (up != null) return `tg:${String(up)}`;
+    }
+  } catch {}
+  return `raw:${crypto.createHash('sha1').update(raw).digest('hex')}`;
 }
 
 function normalizeEvent(channel, body) {
-  const now = Date.now();
-  const ids = extractExternalIds(channel, body);
-
+  const clientId = extractClientId(channel, body);
   const evt = {
     channel,
-    received_at: now,
-    tenant_id: ids.wabaId || null,      // WABA ID define o tenant
+    received_at: Date.now(),
+    client_id: clientId,         // << chave para roteamento por fila
     event_type: 'message.received',
-    aggregate_id: null,
-    external_id: ids.phoneNumberId || ids.wabaId || null,
     payload: body
   };
-
+  // opcional: aggregate_id para auditoria
   try {
     if (channel === 'whatsapp') {
       const change = body?.entry?.[0]?.changes?.[0]?.value;
       const msg = change?.messages?.[0];
-      evt.aggregate_id = msg?.from || ids.phoneNumberId || null;
+      evt.aggregate_id = msg?.from || clientId || null;
     } else if (channel === 'instagram') {
       evt.aggregate_id = String(body?.entry?.[0]?.id ?? 'ig');
     } else if (channel === 'facebook') {
@@ -130,181 +141,122 @@ function normalizeEvent(channel, body) {
       const msg = body?.message || body?.edited_message || {};
       evt.aggregate_id = msg?.chat?.id != null ? String(msg.chat.id) : null;
     }
-  } catch (e) {
-    console.warn('normalizeEvent catch:', e);
-  }
-
+  } catch {}
   return evt;
 }
 
-// Chave de idempotência — preferir IDs únicos por mensagem/evento
-function computeIdempotencyKey(channel, body, raw) {
-  try {
-    if (channel === 'whatsapp') {
-      const change = body?.entry?.[0]?.changes?.[0]?.value;
-      const msgId = change?.messages?.[0]?.id              // wamid da mensagem
-                 || change?.statuses?.[0]?.id;             // id de status (entrega/leitura)
-      if (msgId) {
-        console.log(`🧩 Idempotency (WhatsApp): usando ${msgId}`);
-        return `wa:${msgId}`;
-      }
-    } else if (channel === 'instagram' || channel === 'facebook') {
-      const messaging = body?.entry?.[0]?.messaging?.[0];
-      const mid = messaging?.message?.mid
-               || messaging?.delivery?.mids?.[0]
-               || messaging?.postback?.mid
-               || messaging?.timestamp; // fallback (não perfeito, mas melhor que WABA id)
-      if (mid) {
-        console.log(`🧩 Idempotency (Meta IG/FB): usando ${mid}`);
-        return `meta:${mid}`;
-      }
-    } else if (channel === 'telegram') {
-      const up = body?.update_id;
-      if (up != null) {
-        console.log(`🧩 Idempotency (Telegram): usando update_id=${up}`);
-        return `tg:${String(up)}`;
-      }
-    }
-  } catch (e) {
-    console.warn('computeIdempotencyKey erro:', e?.message);
+// ============ Resolvedor de fila (DB -> cache -> env) ============
+async function resolveQueueAndAMQP(channel, clientId) {
+  console.log(`🔎 resolveQueueAndAMQP: channel=${channel} clientId=${clientId}`);
+
+  // 1) se INCOMING_QUEUE definido, usa sempre ele (ignora DB)
+  if (INCOMING_QUEUE) {
+    return { queue: INCOMING_QUEUE, amqp_url: DEFAULT_AMQP_URL, source: 'env:INCOMING_QUEUE' };
   }
-  const fallback = `raw:${crypto.createHash('sha1').update(raw).digest('hex')}`;
-  console.log(`🧩 Idempotency (fallback): usando ${fallback}`);
-  return fallback;
-}
 
-// Cache endpoint -> route
-async function resolveRouting({ channel, external_id, tenant_id, event_type }) {
-  console.log(`🔍 [${nowIso()}] resolveRouting START
-  channel=${channel}
-  external_id=${external_id}
-  tenant_id=${tenant_id}
-  event_type=${event_type}
-  `);
-
-  const key = `endpoint:${channel}:${external_id || 'none'}`;
+  // 2) tenta cache redis
+  const cacheKey = `ce:${channel}:${clientId || 'none'}`;
   try {
-    const cached = await redis.get(key);
+    const cached = await redis.get(cacheKey);
     if (cached) {
-      console.log(`💾 Cache HIT para chave ${key}`);
-      return JSON.parse(cached);
+      const parsed = JSON.parse(cached);
+      console.log(`💾 cache HIT ${cacheKey} ->`, parsed);
+      return { ...parsed, source: 'cache' };
     }
   } catch (e) {
-    console.warn('Redis GET falhou (seguindo sem cache):', e?.message);
+    console.warn('redis GET falhou (segue sem cache):', e?.message);
   }
 
-  console.log(`💾 Cache MISS para chave ${key}, consultando Postgres...`);
-  const client = await pool.connect();
-  try {
-    console.log('📡 Executando query 1 (channel_endpoints)...');
-    const q1 = await client.query(
-      `SELECT ce.channel, ce.external_id, ce.tenant_id, ce.cluster_id, ce.queue, ce.exchange, ce.routing_key, c.amqp_url
-         FROM channel_endpoints ce
-         JOIN clusters c ON c.cluster_id = ce.cluster_id
-        WHERE ce.channel = $1 AND ce.external_id = $2
-        LIMIT 1`, [channel, external_id]
-    );
-    console.log(`📊 Query 1 retornou ${q1.rowCount} linha(s)`);
-
-    if (q1.rows[0]) {
-      console.log('✅ Encontrado endpoint direto:', safeJson(q1.rows[0]));
-      try { await redis.set(key, JSON.stringify(q1.rows[0]), 'EX', 120); } catch {}
-      return q1.rows[0];
+  // 3) DB — channel_endpoints + clusters
+  if (clientId) {
+    const client = await pool.connect();
+    try {
+      const q = await client.query(
+        `SELECT ce.queue, c.amqp_url
+           FROM channel_endpoints ce
+           JOIN clusters c ON c.cluster_id = ce.cluster_id
+          WHERE ce.channel = $1 AND ce.external_id = $2
+          LIMIT 1`,
+        [channel, clientId]
+      );
+      if (q.rowCount) {
+        const found = { queue: q.rows[0].queue, amqp_url: q.rows[0].amqp_url || DEFAULT_AMQP_URL };
+        try { await redis.set(cacheKey, JSON.stringify(found), 'EX', 120); } catch {}
+        console.log('✅ DB route:', found);
+        return { ...found, source: 'db' };
+      }
+      console.warn('⚠️ DB não encontrou rota (channel_endpoints vazio p/ esse clientId)');
+    } catch (e) {
+      console.error('❌ query channel_endpoints falhou:', e?.message);
+    } finally {
+      client.release();
     }
-
-    console.log('📡 Executando query 2 (routing_rules)...');
-    const q2 = await client.query(
-      `SELECT rr.*, c.amqp_url
-         FROM routing_rules rr
-         JOIN clusters c ON c.cluster_id = rr.cluster_id
-        WHERE (rr.tenant_id = $1 OR rr.tenant_id IS NULL)
-          AND rr.channel = $2 AND rr.event_type = $3
-        ORDER BY (rr.tenant_id IS NOT NULL) DESC, rr.priority DESC
-        LIMIT 1`, [tenant_id, channel, event_type]
-    );
-    console.log(`📊 Query 2 retornou ${q2.rowCount} linha(s)`);
-
-    if (q2.rows[0]) {
-      console.log('✅ Encontrada rota via regra:', safeJson(q2.rows[0]));
-      try { await redis.set(key, JSON.stringify(q2.rows[0]), 'EX', 60); } catch {}
-      return q2.rows[0];
-    }
-
-    console.warn('⚠️ Nenhuma rota encontrada para este evento');
-    return null;
-  } catch (e) {
-    console.error('❌ Erro em resolveRouting:', e);
-    return null;
-  } finally {
-    client.release();
-    console.log(`🔍 [${nowIso()}] resolveRouting END`);
   }
+
+  // 4) Fallback por prefixo: <prefix>.<clientId>
+  if (INCOMING_PREFIX && clientId) {
+    const qname = `${INCOMING_PREFIX}.${clientId}`;
+    console.log('↩️ fallback INCOMING_PREFIX ->', qname);
+    return { queue: qname, amqp_url: DEFAULT_AMQP_URL, source: 'env:INCOMING_PREFIX' };
+  }
+
+  // 5) Fallback final
+  console.log('↩️ fallback padrão -> hmg.incoming');
+  return { queue: 'hmg.incoming', amqp_url: DEFAULT_AMQP_URL, source: 'default' };
 }
 
-// Publisher com confirm channels + pooling simples
-const pools = new Map();
+// ============ AMQP (publish em fila) ============
+const amqpPools = new Map();
 async function getConfirmChannel(amqpUrl) {
   const url = amqpUrl || DEFAULT_AMQP_URL;
-  const existing = pools.get(url);
-  if (existing?.ch && !existing.ch.connectionClosed) {
-    return existing.ch;
-  }
-  console.log(`📡 [${nowIso()}] Conectando ao RabbitMQ: ${redactUrl(url)} | host=${process.env.AMQP_HOST || '-'} vhost=${process.env.AMQP_VHOST || '-'} user=${process.env.AMQP_USER || '-'}`);
+  const cached = amqpPools.get(url);
+  if (cached?.ch && !cached.ch.connectionClosed) return cached.ch;
+
+  console.log(`📡 Conectando Rabbit: ${redact(url)}`);
   const conn = await amqplib.connect(url, { heartbeat: 15 });
   const ch = await conn.createConfirmChannel();
   ch.on('error', (e) => console.error('[amqp ch error]', e));
   ch.on('close', () => console.warn('[amqp ch closed]'));
   conn.on('error', (e) => console.error('[amqp conn error]', e));
   conn.on('close', () => {
-    console.warn('[amqp conn closed]', url);
-    const item = pools.get(url);
-    if (item) item.ch.connectionClosed = true;
+    console.warn('[amqp conn closed]', redact(url));
+    const obj = amqpPools.get(url);
+    if (obj) obj.ch.connectionClosed = true;
   });
-  pools.set(url, { conn, ch });
+  amqpPools.set(url, { conn, ch });
   return ch;
 }
 
-async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) {
-  const ch = await getConfirmChannel(amqpUrl || DEFAULT_AMQP_URL);
+async function publishToQueue({ amqpUrl, queue, body, headers }) {
+  const ch = await getConfirmChannel(amqpUrl);
+  await ch.assertQueue(queue, { durable: true });
 
   const payloadStr = JSON.stringify(body);
-  const payload = Buffer.from(payloadStr);
+  const buf = Buffer.from(payloadStr);
 
-  let ex = exchange || '';
-  let rk = routingKey || '';
-  if (queue && !exchange) {
-    ex = '';
-    rk = queue;
-  }
-
-  console.log(`📤 [${nowIso()}] Publicando mensagem no RabbitMQ:
-    Exchange: ${ex || '(default)'}
-    Routing Key: ${rk}
-    Queue: ${queue || '(nenhuma direta)'}
-    Headers: ${safeJson(headers)}
-    Payload length: ${payload.length}
+  console.log(`📤 Publicando em fila (default exchange):
+    queue=${queue}
+    headers=${safe(headers)}
+    payload_len=${buf.length}
   `);
 
-  const ok = ch.publish(ex, rk, payload, {
+  const ok = ch.publish('', queue, buf, {
     persistent: true,
-    headers,
+    headers: headers || {},
     contentType: 'application/json'
   });
-
   if (!ok) {
-    console.warn('⚠️ Buffer cheio, aguardando RabbitMQ liberar (drain)...');
+    console.warn('⚠️ buffer cheio — aguardando drain...');
     await new Promise((res) => ch.once('drain', res));
   }
-
-  console.log('⏳ Aguardando confirmação do RabbitMQ...');
   await ch.waitForConfirms();
-  console.log('✅ Mensagem confirmada pelo RabbitMQ!');
+  console.log('✅ confirmado pelo RabbitMQ');
 }
 
-// ============ Fastify app ============
+// ============ Fastify ============
 const app = Fastify({
   logger: { level: 'info' },
-  bodyLimit: 2 * 1024 * 1024, // 2MB
+  bodyLimit: 2 * 1024 * 1024,
   trustProxy: true
 });
 
@@ -316,199 +268,132 @@ app.register(rawBody, {
   routes: []
 });
 
-// Healthchecks
+// Health/Ready
 app.get('/healthz', async (_req, reply) => reply.send({ ok: true, ts: nowIso() }));
-
 app.get('/readyz', async (_req, reply) => {
   try {
     await pool.query('SELECT 1');
-    try { await redis.ping(); } catch (e) {
-      console.warn('Redis ping falhou em /readyz:', e?.message);
-      throw e;
-    }
-    const conn = await amqplib.connect(DEFAULT_AMQP_URL, { heartbeat: 10 });
-    await conn.close();
+    try { await redis.ping(); } catch (e) { throw new Error('redis: ' + e.message); }
+    const c = await amqplib.connect(DEFAULT_AMQP_URL, { heartbeat: 10 });
+    await c.close();
     return reply.send({ ready: true, ts: nowIso() });
   } catch (e) {
     return reply.code(500).send({ ready: false, error: e?.message, ts: nowIso() });
   }
 });
 
-// GET /webhook (Meta validation)
+// Verificação Meta
 app.get('/webhook', async (req, reply) => {
-  console.log('\n===== 📥 GET /webhook =====');
-  console.log(`🕒 ${nowIso()}`);
-  console.log('➡️ Query Params:', safeJson(req.query));
-  console.log('➡️ Headers:', safeJson(req.headers));
+  const q = req.query || {};
+  const mode = q['hub.mode'] || q.hub_mode;
+  const challenge = q['hub.challenge'] || q.hub_challenge;
+  const token = q['hub.verify_token'] || q.hub_verify_token;
 
-  const {
-    'hub.mode': hubMode,
-    'hub.challenge': hubChallenge,
-    'hub.verify_token': hubVerifyToken,
-    hub_mode, hub_challenge, hub_verify_token
-  } = req.query || {};
-  const mode = hubMode || hub_mode;
-  const challenge = hubChallenge || hub_challenge;
-  const verifyToken = hubVerifyToken || hub_verify_token;
-
-  if (mode === 'subscribe' && verifyToken === META_VERIFY_TOKEN) {
-    console.log('✅ Verificação Meta OK — enviando challenge');
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    req.log.info('✅ Meta verify OK');
     return reply.type('text/plain').send(challenge ?? '');
   }
-  console.warn('❌ Verificação Meta FALHOU');
+  req.log.warn('❌ Meta verify FAIL');
   return reply.code(403).send({ error: 'verification failed' });
 });
 
-// POST /webhook (principal)
+// Webhook principal
 app.post('/webhook', async (req, reply) => {
-  console.log('\n===== 📥 NOVO POST /webhook =====');
-  console.log(`🕒 ${nowIso()}`);
-  console.log('➡️ Headers:', safeJson(req.headers));
-  console.log('➡️ Body:', safeJson(req.body));
-  console.log('➡️ Raw Body:', typeof req.rawBody === 'string' ? req.rawBody : '[buffer/obj]');
+  console.log('\n===== 📥 POST /webhook =====');
+  console.log('🕒', nowIso());
+  console.log('➡️ Headers:', safe(req.headers));
+  console.log('➡️ Body:', safe(req.body));
 
   const raw = Buffer.isBuffer(req.rawBody)
     ? req.rawBody
     : Buffer.from(
-        typeof req.rawBody === 'string'
-          ? req.rawBody
-          : JSON.stringify(req.body || {})
+        typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {})
       );
 
-  const headers = req.headers || {};
-  const channel = detectChannel(req.body, headers);
-  console.log(`🎯 Canal detectado: ${channel}`);
+  const channel = detectChannel(req.body, req.headers);
+  console.log('🎯 channel:', channel);
 
   if (channel === 'unknown') {
-    console.warn('❌ Canal não reconhecido — retornando 400');
+    console.warn('❌ canal desconhecido');
     return reply.code(400).send({ error: 'unknown channel' });
   }
 
-  // Validações (permissivas para facilitar teste)
+  // Validações permissivas (só loga)
   if (channel === 'telegram') {
-    const ok = verifyTelegramSecret(headers['x-telegram-bot-api-secret-token']);
-    if (!ok) {
-      console.warn('❌ Telegram secret inválido');
-      return reply.code(401).send({ error: 'telegram secret invalid' });
-    } else if (!TELEGRAM_SECRET) {
-      console.warn('⚠️ Telegram sem TELEGRAM_SECRET definido — modo compat');
+    if (!req.headers['x-telegram-bot-api-secret-token']) {
+      console.warn('⚠️ Telegram sem secret header (permitido)');
+    } else if (TELEGRAM_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== TELEGRAM_SECRET) {
+      console.warn('❌ Telegram secret inválido (permitindo para teste)');
     }
-  } else { // Meta
-    const ok = verifyMetaSignature(headers['x-hub-signature-256'], raw);
-    if (!ok) {
-      console.warn('❌ Meta assinatura inválida (modo permissivo — seguindo).');
-      // Se quiser BLOQUEAR quando inválida, descomente a linha abaixo:
-      // return reply.code(401).send({ error: 'meta signature invalid' });
-    } else if (!META_APP_SECRET) {
-      console.warn('⚠️ META_APP_SECRET vazio — validação skip (modo compat)');
-    }
+  } else {
+    const ok = verifyMetaSignature(req.headers['x-hub-signature-256'], raw);
+    if (!ok) console.warn('⚠️ Meta assinatura inválida (permitindo)');
   }
 
   const evt = normalizeEvent(channel, req.body || {});
-  console.log('📦 Evento normalizado:', safeJson(evt));
-
-  // Chave de idempotência por mensagem/evento
   const msgId = computeIdempotencyKey(channel, req.body || {}, raw);
-  console.log(`🔑 Idempotency Key: ${msgId}`);
+  console.log('🔑 idempotency:', msgId);
 
-  // Checagem idempotência
-  let wrote;
+  // Idempotência
   try {
-    const idemKey = `idem:${msgId}`;
-    wrote = await redis.set(idemKey, '1', 'EX', 300, 'NX');
-    console.log(`💾 Redis SET ${idemKey} => ${wrote}`);
+    const wrote = await redis.set(`idem:${msgId}`, '1', 'EX', 300, 'NX');
+    if (wrote !== 'OK') {
+      console.log('♻️ duplicate');
+      return reply.send({ status: 'duplicate' });
+    }
   } catch (e) {
-    console.error('Redis SET falhou — seguindo mesmo assim:', e?.message);
+    console.warn('redis set idem falhou — seguindo:', e?.message);
   }
 
-  if (wrote !== 'OK') {
-    console.log('♻️ Evento duplicado — retornando duplicate');
-    return reply.send({ status: 'duplicate' });
-  }
-
-  console.log('📍 Resolvendo rota...');
-  const route = await resolveRouting({
-    channel,
-    external_id: evt.external_id,
-    tenant_id: evt.tenant_id,
-    event_type: evt.event_type
-  });
-  console.log('🛣️ Rota obtida:', safeJson(route));
-
-  if (!route) {
-    console.warn('⚠️ Nenhuma rota encontrada — retornando 422');
-    return reply.code(422).send({ error: 'no routing for endpoint' });
-  }
+  // Descobre fila + AMQP url
+  const clientId = evt.client_id || null;
+  const route = await resolveQueueAndAMQP(channel, clientId);
+  console.log('🛣️ rota:', route);
 
   try {
-    console.log('🚀 Publicando no RabbitMQ...');
-    await publish({
+    await publishToQueue({
       amqpUrl: route.amqp_url || DEFAULT_AMQP_URL,
       queue: route.queue,
-      exchange: route.exchange,
-      routingKey: route.routing_key,
       body: evt,
-      headers: { 'x-idempotency-key': msgId, 'x-channel': channel }
+      headers: { 'x-idempotency-key': msgId, 'x-channel': channel, 'x-client-id': clientId || '' }
     });
-    console.log('✅ Publicação concluída');
   } catch (e) {
-    console.error('❌ Erro ao publicar no RabbitMQ:', e);
+    console.error('❌ publish falhou:', e?.message);
     return reply.code(202).send({ status: 'accepted_parking' });
   }
 
-  console.log('🏁 Fluxo finalizado — 202 Accepted');
+  console.log('🏁 done → 202');
   return reply.code(202).send({ status: 'accepted' });
 });
 
-// ============ Inicialização & Shutdown ============
+// Boot
 (async () => {
-  console.log('🌐 Boot iniciando...', nowIso());
-
-  // Conecta Redis (fail fast + retry interno)
-  try {
-    await redis.connect();
-    console.log('✅ Redis conectado');
-  } catch (e) {
-    console.warn('⚠️ Redis não conectou ainda (retry automático):', e?.message);
-  }
-
-  // Teste rápido de Postgres
-  try {
-    await pool.query('SELECT 1');
-    console.log('✅ Postgres OK');
-  } catch (e) {
-    console.warn('⚠️ Postgres indisponível no boot (readyz refletirá):', e?.message);
-  }
-
+  console.log('🌐 boot...', nowIso());
+  try { await redis.connect(); console.log('✅ redis OK'); } catch (e) { console.warn('redis pendente:', e?.message); }
+  try { await pool.query('SELECT 1'); console.log('✅ postgres OK'); } catch (e) { console.warn('postgres pendente:', e?.message); }
   try {
     await app.listen({ port: PORT, host: '0.0.0.0' });
-    app.log.info('🚀 Webhook listening on :' + PORT);
+    app.log.info('🚀 listening on :' + PORT);
   } catch (e) {
-    console.error('❌ Falha ao subir servidor:', e);
+    console.error('❌ falha ao subir:', e);
     process.exit(1);
   }
 })();
 
-// Encerramento gracioso
+// Shutdown
 async function shutdown(reason) {
-  console.log(`🛑 Shutdown iniciado: ${reason} — ${nowIso()}`);
-  try { await app.close(); } catch (e) { console.warn('app.close erro:', e?.message); }
-  try { await pool.end(); } catch (e) { console.warn('pool.end erro:', e?.message); }
-  try { await redis.quit(); } catch (e) { console.warn('redis.quit erro:', e?.message); }
-  for (const [url, obj] of pools.entries()) {
+  console.log(`🛑 shutdown ${reason} @ ${nowIso()}`);
+  try { await app.close(); } catch {}
+  try { await pool.end(); } catch {}
+  try { await redis.quit(); } catch {}
+  for (const [url, obj] of amqpPools.entries()) {
     try { await obj?.ch?.close(); } catch {}
     try { await obj?.conn?.close(); } catch {}
-    console.log('AMQP fechado:', redactUrl(url));
+    console.log('AMQP fechado:', redact(url));
   }
-  console.log('✅ Shutdown concluído');
   process.exit(0);
 }
-
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('unhandledRejection', (err) => {
-  console.error('UnhandledRejection:', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('UncaughtException:', err);
-});
+process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
+process.on('uncaughtException',  (e) => console.error('uncaughtException', e));
