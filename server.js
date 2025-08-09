@@ -58,26 +58,45 @@ function verifyTelegramSecret(tokenHeader) {
   return tokenHeader === TELEGRAM_SECRET;
 }
 
-function extractExternalId(channel, body) {
-  if (channel === 'whatsapp')   return body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id || null;
-  if (channel === 'instagram')  return String(body?.entry?.[0]?.id ?? '') || null;
-  if (channel === 'facebook')   return String(body?.entry?.[0]?.id ?? '') || null;
-  if (channel === 'telegram')   return TELEGRAM_ENDPOINT_ID || null;
-  return null;
+function extractExternalIds(channel, body) {
+  if (channel === 'whatsapp') {
+    return {
+      wabaId: body?.entry?.[0]?.id || null,
+      phoneNumberId: body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id || null
+    };
+  }
+  if (channel === 'instagram' || channel === 'facebook') {
+    return {
+      wabaId: String(body?.entry?.[0]?.id ?? '') || null
+    };
+  }
+  if (channel === 'telegram') {
+    return {
+      wabaId: TELEGRAM_ENDPOINT_ID || null
+    };
+  }
+  return {};
 }
 
 function normalizeEvent(channel, body) {
   const now = Date.now();
+  const ids = extractExternalIds(channel, body);
+  
   const evt = {
-    channel, received_at: now, tenant_id: null,
-    event_type: 'message.received', aggregate_id: null, external_id: extractExternalId(channel, body),
+    channel,
+    received_at: now,
+    tenant_id: ids.wabaId, // WABA ID define o tenant
+    event_type: 'message.received',
+    aggregate_id: null,
+    external_id: ids.phoneNumberId || ids.wabaId, // número ou fallback pro WABA
     payload: body
   };
+
   try {
     if (channel === 'whatsapp') {
       const change = body.entry?.[0]?.changes?.[0]?.value;
       const msg = change?.messages?.[0];
-      evt.aggregate_id = msg?.from || change?.metadata?.phone_number_id || null;
+      evt.aggregate_id = msg?.from || ids.phoneNumberId || null;
     } else if (channel === 'instagram') {
       evt.aggregate_id = String(body.entry?.[0]?.id ?? 'ig');
     } else if (channel === 'facebook') {
@@ -88,6 +107,7 @@ function normalizeEvent(channel, body) {
       evt.aggregate_id = String(msg.chat?.id ?? '');
     }
   } catch {}
+
   return evt;
 }
 
