@@ -175,7 +175,9 @@ app.get('/readyz', async (_req, reply) => {
 });
 
 app.get('/webhook', async (req, reply) => {
-  console.log("get = " + req)
+    console.log('📥 GET /webhook recebido:');
+  console.log('➡️ Query Params:', JSON.stringify(req.query, null, 2));
+  console.log('➡️ Headers:', JSON.stringify(req.headers, null, 2));
   const { 'hub.mode': hubMode, 'hub.challenge': hubChallenge, 'hub.verify_token': hubVerifyToken, hub_mode, hub_challenge, hub_verify_token } = req.query || {};
 const mode = hubMode || hub_mode;
 const challenge = hubChallenge || hub_challenge;
@@ -188,7 +190,10 @@ const verifyToken = hubVerifyToken || hub_verify_token;
 });
 
 app.post('/webhook', async (req, reply) => {
-  console.log("post = " + req)
+    console.log('📥 POST /webhook recebido:');
+  console.log('➡️ Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('➡️ Body:', JSON.stringify(req.body, null, 2));
+  console.log('➡️ Raw Body:', req.rawBody);
   const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(req.rawBody || JSON.stringify(req.body || {}));
   const headers = req.headers || {};
   const channel = detectChannel(req.body, headers);
