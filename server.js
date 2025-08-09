@@ -113,12 +113,24 @@ function normalizeEvent(channel, body) {
 
 // Cache endpoint -> route
 async function resolveRouting({ channel, external_id, tenant_id, event_type }) {
+  console.log(`🔍 Iniciando resolveRouting:
+    channel=${channel}
+    external_id=${external_id}
+    tenant_id=${tenant_id}
+    event_type=${event_type}
+  `);
+
   const key = `endpoint:${channel}:${external_id || 'none'}`;
   const cached = await redis.get(key);
-  if (cached) return JSON.parse(cached);
+  if (cached) {
+    console.log(`💾 Cache HIT para chave ${key}`);
+    return JSON.parse(cached);
+  }
+  console.log(`💾 Cache MISS para chave ${key}, consultando Postgres...`);
 
   const client = await pool.connect();
   try {
+    console.log('📡 Executando query 1 (channel_endpoints)...');
     const q1 = await client.query(
       `SELECT ce.channel, ce.external_id, ce.tenant_id, ce.cluster_id, ce.queue, ce.exchange, ce.routing_key, c.amqp_url
          FROM channel_endpoints ce
@@ -126,10 +138,15 @@ async function resolveRouting({ channel, external_id, tenant_id, event_type }) {
         WHERE ce.channel = $1 AND ce.external_id = $2
         LIMIT 1`, [channel, external_id]
     );
+    console.log(`📊 Query 1 retornou ${q1.rowCount} linha(s)`);
+
     if (q1.rows[0]) {
+      console.log('✅ Encontrado endpoint direto:', q1.rows[0]);
       await redis.set(key, JSON.stringify(q1.rows[0]), 'EX', 120);
       return q1.rows[0];
     }
+
+    console.log('📡 Executando query 2 (routing_rules)...');
     const q2 = await client.query(
       `SELECT rr.*, c.amqp_url
          FROM routing_rules rr
@@ -139,10 +156,15 @@ async function resolveRouting({ channel, external_id, tenant_id, event_type }) {
         ORDER BY (rr.tenant_id IS NOT NULL) DESC, rr.priority DESC
         LIMIT 1`, [tenant_id, channel, event_type]
     );
+    console.log(`📊 Query 2 retornou ${q2.rowCount} linha(s)`);
+
     if (q2.rows[0]) {
+      console.log('✅ Encontrada rota via regra:', q2.rows[0]);
       await redis.set(key, JSON.stringify(q2.rows[0]), 'EX', 60);
       return q2.rows[0];
     }
+
+    console.warn('⚠️ Nenhuma rota encontrada para este evento');
     return null;
   } finally {
     client.release();
@@ -164,9 +186,10 @@ async function getConfirmChannel(amqpUrl) {
 }
 
 async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) {
+  console.log(`📡 Conectando ao RabbitMQ: ${amqpUrl || DEFAULT_AMQP_URL}`);
   const ch = await getConfirmChannel(amqpUrl || DEFAULT_AMQP_URL);
-  const payload = Buffer.from(JSON.stringify(body));
 
+  const payload = Buffer.from(JSON.stringify(body));
   let ex = exchange || '';
   let rk = routingKey || '';
   if (queue && !exchange) {
@@ -174,7 +197,7 @@ async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) 
     rk = queue;
   }
 
-  console.log(`📤 Enviando para RabbitMQ:
+  console.log(`📤 Publicando mensagem no RabbitMQ:
     Exchange: ${ex || '(default)'}
     Routing Key: ${rk}
     Queue: ${queue || '(nenhuma direta)'}
@@ -182,13 +205,18 @@ async function publish({ amqpUrl, queue, exchange, routingKey, body, headers }) 
     Payload: ${payload.toString()}
   `);
 
-  const ok = ch.publish(ex, rk, payload, { persistent: true, headers, contentType: 'application/json' });
+  const ok = ch.publish(ex, rk, payload, {
+    persistent: true,
+    headers,
+    contentType: 'application/json'
+  });
 
   if (!ok) {
     console.warn('⚠️ Buffer cheio, aguardando RabbitMQ liberar...');
     await new Promise(res => ch.once('drain', res));
   }
 
+  console.log('⏳ Aguardando confirmação do RabbitMQ...');
   await ch.waitForConfirms();
   console.log('✅ Mensagem confirmada pelo RabbitMQ!');
 }
