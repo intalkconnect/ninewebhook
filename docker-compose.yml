@@ -1,0 +1,133 @@
+version: "3.9"
+
+services:
+  app:
+    image: node:20-alpine
+    container_name: webhook-app
+    working_dir: /app
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+
+      # --- Postgres ---
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ninedb
+      PGUSER: postgres
+      PGPASSWORD: "Alice*321"
+
+      # --- Redis ---
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+
+      # --- RabbitMQ ---
+      DEFAULT_AMQP_URL: amqp://guest:guest@rabbit:5672/
+      FALLBACK_QUEUE: hmg.incoming
+
+      # --- Meta/Telegram (opcionais) ---
+      META_APP_SECRET: "5daeaff8d0447f7469f854b6082bb2d1"
+      META_VERIFY_TOKEN: "meta_verify_82a7f6c9ba"
+      TELEGRAM_SECRET: ""
+      TELEGRAM_ENDPOINT_ID: "8264496732:AAHNXxzWeLIfYk7nAPFWGVteQLRb9i5yGlc"
+
+    command: >
+      sh -lc '
+        set -e;
+        apk add --no-cache git;
+        cd /; rm -rf /app && mkdir -p /app;
+        git clone --depth=1 https://github.com/intalkconnect/testelab.git /app;
+        cd /app;
+        if [ -f package-lock.json ]; then
+          npm ci --omit=dev;
+        else
+          npm install --omit=dev --no-audit --no-fund --legacy-peer-deps || true;
+          node -e "for (const m of [\"fastify\",\"fastify-raw-body\",\"amqplib\",\"pg\",\"ioredis\"]) { try { require.resolve(m) } catch { process.exitCode = 1 } }";
+          if [ "$?" != "0" ]; then
+            npm install fastify fastify-raw-body amqplib pg ioredis --no-audit --no-fund --legacy-peer-deps;
+          fi
+        fi;
+        node server.js
+      '
+
+    ports:
+      - "3000:3000"   # para teste; depois pode remover e deixar só via NPM
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    depends_on:
+      - redis
+      - rabbit
+      - postgres
+
+    networks:
+      - internal
+      - npm_bridge
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: webhook-redis
+    command: >
+      sh -c "redis-server --appendonly yes --save 60 1000 --maxmemory 256mb --maxmemory-policy allkeys-lru"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+    restart: unless-stopped
+
+  rabbit:
+    image: rabbitmq:3-management-alpine
+    container_name: webhook-rabbit
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # painel RabbitMQ
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: webhook-postgres
+    environment:
+      POSTGRES_DB: ninedb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "Alice*321"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ninedb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+  npm_bridge:
+    external: true
+
+volumes:
+  redis_data:
+  rabbitmq_data:
+  postgres_data:
