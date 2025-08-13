@@ -1,4 +1,4 @@
-// server.js — Webhook único (Fastify) — usa channel_endpoints(channel, external_id, cluster_id, queue)
+// server.js — Webhook único (Fastify) — resolve fila como <subdomain>.incoming via public.tenants
 
 'use strict';
 
@@ -18,7 +18,6 @@ const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
 
 // Telegram (modo permissivo: não bloqueia se faltar)
 const TELEGRAM_SECRET = process.env.TELEGRAM_SECRET || '';
-const TELEGRAM_ENDPOINT_ID = process.env.TELEGRAM_ENDPOINT_ID || '';
 
 // Postgres
 const { Pool } = pg;
@@ -32,7 +31,7 @@ const pool = new Pool({
   idleTimeoutMillis: 10000
 });
 
-// Redis (idempotência)
+// Redis (idempotência + cache)
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'redis',
   port: Number(process.env.REDIS_PORT || 6379),
@@ -42,7 +41,10 @@ const redis = new Redis({
 
 // Rabbit
 const DEFAULT_AMQP_URL = process.env.DEFAULT_AMQP_URL || 'amqp://guest:guest@rabbitmq:5672/';
-const FALLBACK_QUEUE = process.env.FALLBACK_QUEUE || 'hmg.incoming';
+const FALLBACK_QUEUE   = process.env.FALLBACK_QUEUE   || 'hmg.incoming';
+
+// Template de fila (ex.: "%s.incoming" -> "hmg.incoming")
+const QUEUE_TEMPLATE = process.env.QUEUE_TEMPLATE || '%s.incoming';
 
 // ========= Utils =========
 const now = () => new Date().toISOString();
@@ -76,15 +78,15 @@ function verifyTelegramSecret(tokenHeader) {
 }
 
 // ========= Extração de IDs =========
-// ATENÇÃO: isso define o external_id que será usado no SELECT ao Postgres.
-function extractLookupId(channel, body, headers) {
+// ATENÇÃO: isto define o external_id usado para localizar o tenant
+function extractLookupId(channel, body, headersLower) {
   if (channel === 'whatsapp' || channel === 'instagram' || channel === 'facebook') {
-    // *** COMO VOCÊ PEDIU: usar SEMPRE entry[0].id ***
+    // Meta: sempre entry[0].id (ex.: phone_number_id para WA)
     return body?.entry?.[0]?.id || null;
   }
   if (channel === 'telegram') {
-    // *** COMO VOCÊ PEDIU: usar o header x-telegram-bot-api-secret-token ***
-    return headers['x-telegram-bot-api-secret-token'] || null;
+    // Telegram: header do "bot api secret token"
+    return headersLower['x-telegram-bot-api-secret-token'] || null;
   }
   return null;
 }
@@ -119,43 +121,58 @@ function normalizeEvent(channel, body) {
   return out;
 }
 
-// ========= Roteamento via Postgres =========
-// Usa TABELA: channel_endpoints(channel, external_id, cluster_id, queue)
-// -> retorna { queue } ou null
-async function resolveQueue({ channel, lookupId }) {
-  console.log(`🔎 resolveQueue: channel=${channel} lookupId=${lookupId}`);
+// ========= Roteamento via Postgres/Redis =========
+// 1) tenta descobrir o tenant por external_id em public.tenants
+// 2) se achar, retorna queue = <subdomain>.incoming
+// 3) senão, tenta channel_endpoints(channel, external_id) -> queue
+// 4) senão, FALLBACK_QUEUE
+// 1) tenta descobrir o tenant por external_id em public.tenants
+// 2) se achar -> queue = <subdomain>.incoming
+// 3) se não achar -> FALLBACK_QUEUE (sem channel_endpoints)
+async function resolveTenantAndQueue({ channel, lookupId }) {
+  console.log(`🔎 resolveTenantAndQueue: channel=${channel} lookupId=${lookupId}`);
+
   if (!lookupId) {
-    console.warn('⚠️ lookupId vazio — fallback');
-    return { queue: FALLBACK_QUEUE, source: 'fallback' };
+    console.warn('⚠️ lookupId vazio — usando fallback');
+    return { queue: FALLBACK_QUEUE, source: 'fallback', tenant: null };
   }
 
-  const key = `ce:${channel}:${lookupId}`;
+  const cacheKey = `tenantByExt:${channel}:${lookupId}`;
   try {
-    const cached = await redis.get(key);
-    if (cached) {
-      console.log(`💾 cache HIT ${key}`);
-      return JSON.parse(cached);
-    }
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
   } catch (e) {
     console.warn('Redis GET falhou (segue sem cache):', e?.message);
   }
 
   const client = await pool.connect();
   try {
-    const sql = `
-      SELECT queue
-      FROM channel_endpoints
-      WHERE channel = $1 AND external_id = $2
-      LIMIT 1
-    `;
-    const { rows } = await client.query(sql, [channel, String(lookupId)]);
-    if (rows[0]?.queue) {
-      const res = { queue: rows[0].queue, source: 'db' };
-      try { await redis.set(key, JSON.stringify(res), 'EX', 120); } catch {}
-      return res;
+    const col =
+      channel === 'whatsapp' ? 'whatsapp_external_id'  :
+      channel === 'telegram' ? 'telegram_external_id'  :
+      channel === 'instagram'? 'instagram_external_id' :
+      channel === 'facebook' ? 'facebook_external_id'  :
+      null;
+
+    if (col) {
+      const sqlTenant = `
+        SELECT subdomain
+          FROM public.tenants
+         WHERE ${col} = $1
+         LIMIT 1
+      `;
+      const t = await client.query(sqlTenant, [String(lookupId)]);
+      if (t.rows[0]?.subdomain) {
+        const tenant = t.rows[0].subdomain;
+        const queue  = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', tenant);
+        const res = { queue, source: 'tenants', tenant };
+        try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+        return res;
+      }
     }
-    console.warn('⚠️ NENHUMA fila encontrada no DB — fallback');
-    return { queue: FALLBACK_QUEUE, source: 'fallback' };
+
+    // Sem channel_endpoints: caiu aqui, usa fila padrão
+    return { queue: FALLBACK_QUEUE, source: 'fallback', tenant: null };
   } finally {
     client.release();
   }
@@ -186,7 +203,6 @@ async function publishToQueue({ queue, body, headers }) {
   headers=${safe(headers)}
   payload_len=${payload.length}`);
 
-  // default exchange => routingKey=queue
   const ok = ch.publish('', queue, payload, {
     persistent: true,
     contentType: 'application/json',
@@ -258,7 +274,7 @@ app.post('/webhook', async (req, reply) => {
 
   // validações permissivas:
   if (channel === 'telegram') {
-    const ok = verifyTelegramSecret(req.headers['x-telegram-bot-api-secret-token']);
+    const ok = verifyTelegramSecret(String(req.headers['x-telegram-bot-api-secret-token'] || ''));
     if (!ok) console.warn('⚠️ Telegram secret inválido (permitindo p/ compat)');
   } else {
     const ok = verifyMetaSignature(req.headers['x-hub-signature-256'], raw);
@@ -276,7 +292,7 @@ app.post('/webhook', async (req, reply) => {
       const up = req.body?.update_id;
       idemKey = (up != null) ? `tg:${String(up)}` : null;
     } else {
-      // IG/FB: usa timestamp/mid se existir — ou hash do raw
+      // IG/FB: usa hash do raw
       idemKey = crypto.createHash('sha1').update(raw).digest('hex');
     }
   } catch {}
@@ -289,14 +305,12 @@ app.post('/webhook', async (req, reply) => {
   }
   console.log('🔑 idempotency:', idemKey);
 
-  // monta evento e resolve FILA por external_id:
+  // monta evento e resolve TENANT -> QUEUE
   const evt = normalizeEvent(channel, req.body || {});
-  const lookupId = extractLookupId(channel, req.body || {}, Object.fromEntries(
-    Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v])
-  ));
+  const headersLower = Object.fromEntries(Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
+  const lookupId = extractLookupId(channel, req.body || {}, headersLower);
 
-  console.log('🔎 resolveQueue: channel=%s external_id(lookup)=%s', channel, lookupId);
-  const route = await resolveQueue({ channel, lookupId });
+  const route = await resolveTenantAndQueue({ channel, lookupId });
   console.log('🛣️ rota:', safe(route));
 
   try {
@@ -304,12 +318,14 @@ app.post('/webhook', async (req, reply) => {
       queue: route.queue || FALLBACK_QUEUE,
       body: {
         ...evt,
-        channel_lookup_external_id: lookupId, // informação útil no payload
+        channel_lookup_external_id: lookupId,
+        tenant: route.tenant || null,
       },
       headers: {
         'x-idempotency-key': idemKey,
         'x-channel': channel,
-        'x-external-id': String(lookupId || '')
+        'x-external-id': String(lookupId || ''),
+        'x-tenant': String(route.tenant || '')
       }
     });
   } catch (e) {
