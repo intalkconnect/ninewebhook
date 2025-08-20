@@ -1,4 +1,9 @@
-// server.js — Webhook único (Fastify) — resolve fila como <subdomain>.incoming via public.tenants
+// server.js — Webhook único (Fastify)
+// Roteia fila como <subdomain>.incoming via public.tenant_channel_connections
+// - Prioridade de lookup:
+//   1) tenant_channel_connections(channel, external_id)  // ex.: WhatsApp -> phone_number_id
+//   2) tenant_channel_connections(channel, account_id)   // ex.: WhatsApp -> WABA_ID
+//   3) public.tenants.*_external_id (LEGADO)             // compatibilidade
 
 'use strict';
 
@@ -80,12 +85,28 @@ function verifyTelegramSecret(tokenHeader) {
 // ========= Extração de IDs =========
 // ATENÇÃO: isto define o external_id usado para localizar o tenant
 function extractLookupId(channel, body, headersLower) {
-  if (channel === 'whatsapp' || channel === 'instagram' || channel === 'facebook') {
-    // Meta: sempre entry[0].id (ex.: phone_number_id para WA)
+  if (channel === 'whatsapp') {
+    const entry  = body?.entry?.[0];
+    const change = entry?.changes?.[0]?.value;
+    // 1) preferir phone_number_id (mais granular por número)
+    const phoneId = change?.metadata?.phone_number_id;
+    if (phoneId) return phoneId;
+    // 2) fallback: WABA_ID
+    const wabaId = entry?.id;
+    if (wabaId) return wabaId;
+    return null;
+  }
+  if (channel === 'instagram') {
+    // normalmente é o IG business account id
     return body?.entry?.[0]?.id || null;
   }
+  if (channel === 'facebook') {
+    // Messenger: preferir PSID do sender; fallback page id (entry[0].id)
+    const msg = body?.entry?.[0]?.messaging?.[0];
+    return msg?.sender?.id || body?.entry?.[0]?.id || null;
+  }
   if (channel === 'telegram') {
-    // Telegram: header do "bot api secret token"
+    // seu header do "bot api secret token"
     return headersLower['x-telegram-bot-api-secret-token'] || null;
   }
   return null;
@@ -122,13 +143,10 @@ function normalizeEvent(channel, body) {
 }
 
 // ========= Roteamento via Postgres/Redis =========
-// 1) tenta descobrir o tenant por external_id em public.tenants
-// 2) se achar, retorna queue = <subdomain>.incoming
-// 3) senão, tenta channel_endpoints(channel, external_id) -> queue
-// 4) senão, FALLBACK_QUEUE
-// 1) tenta descobrir o tenant por external_id em public.tenants
-// 2) se achar -> queue = <subdomain>.incoming
-// 3) se não achar -> FALLBACK_QUEUE (sem channel_endpoints)
+// Nova ordem de resolução:
+// 1) public.tenant_channel_connections(channel, external_id)
+// 2) public.tenant_channel_connections(channel, account_id)
+// 3) LEGADO: public.tenants.<canal>_external_id
 async function resolveTenantAndQueue({ channel, lookupId }) {
   console.log(`🔎 resolveTenantAndQueue: channel=${channel} lookupId=${lookupId}`);
 
@@ -147,31 +165,68 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
 
   const client = await pool.connect();
   try {
-    const col =
+    // 1) Tenta match direto por external_id (ex.: WhatsApp -> phone_number_id)
+    const sqlExternal = `
+      SELECT subdomain
+        FROM public.tenant_channel_connections
+       WHERE channel = $1
+         AND external_id = $2
+         AND is_active = true
+       LIMIT 1
+    `;
+    let r = await client.query(sqlExternal, [channel, String(lookupId)]);
+    if (r.rows[0]?.subdomain) {
+      const sd = r.rows[0].subdomain;
+      const queue = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
+      const res = { queue, source: 'tcc_external', tenant: sd };
+      try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+      return res;
+    }
+
+    // 2) Fallback: tenta por account_id (ex.: WABA_ID)
+    const sqlAccount = `
+      SELECT subdomain
+        FROM public.tenant_channel_connections
+       WHERE channel = $1
+         AND account_id = $2
+         AND is_active = true
+       LIMIT 1
+    `;
+    r = await client.query(sqlAccount, [channel, String(lookupId)]);
+    if (r.rows[0]?.subdomain) {
+      const sd = r.rows[0].subdomain;
+      const queue = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
+      const res = { queue, source: 'tcc_account', tenant: sd };
+      try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+      return res;
+    }
+
+    // 3) LEGADO: colunas em public.tenants
+    const legacyCol =
       channel === 'whatsapp' ? 'whatsapp_external_id'  :
       channel === 'telegram' ? 'telegram_external_id'  :
       channel === 'instagram'? 'instagram_external_id' :
       channel === 'facebook' ? 'facebook_external_id'  :
       null;
 
-    if (col) {
+    if (legacyCol) {
       const sqlTenant = `
         SELECT subdomain
           FROM public.tenants
-         WHERE ${col} = $1
+         WHERE ${legacyCol} = $1
          LIMIT 1
       `;
       const t = await client.query(sqlTenant, [String(lookupId)]);
       if (t.rows[0]?.subdomain) {
-        const tenant = t.rows[0].subdomain;
-        const queue  = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', tenant);
-        const res = { queue, source: 'tenants', tenant };
-        try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+        const sd = t.rows[0].subdomain;
+        const queue  = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
+        const res = { queue, source: 'tenants_legacy', tenant: sd };
+        try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 120); } catch {}
         return res;
       }
     }
 
-    // Sem channel_endpoints: caiu aqui, usa fila padrão
+    // Fallback final
     return { queue: FALLBACK_QUEUE, source: 'fallback', tenant: null };
   } finally {
     client.release();
