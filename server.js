@@ -271,6 +271,43 @@ async function publishToQueue({ queue, body, headers }) {
   console.log('✅ confirmado pelo RabbitMQ');
 }
 
+// ========= (NOVO) Helpers de STATUS do WhatsApp =========
+function waChange(body) {
+  return body?.entry?.[0]?.changes?.[0]?.value || null;
+}
+function isWaStatus(body) {
+  const st = waChange(body)?.statuses;
+  return Array.isArray(st) && st.length > 0;
+}
+function listWaStatuses(body) {
+  const st = waChange(body)?.statuses;
+  return Array.isArray(st) ? st : [];
+}
+function buildWaStatusEvent(fullBody, st) {
+  const change = waChange(fullBody);
+  const phoneNumberId = change?.metadata?.phone_number_id || null;
+  const wabaId = fullBody?.entry?.[0]?.id || null;
+
+  return {
+    channel: 'whatsapp',
+    received_at: Date.now(),
+    event_type: 'message.status',
+    aggregate_id: st?.recipient_id || phoneNumberId || null,
+    payload: fullBody,
+    meta: {
+      id: st?.id || null,
+      status: st?.status || null, // sent|delivered|read|failed
+      timestamp: st?.timestamp || null,
+      recipient_id: st?.recipient_id || null,
+      conversation: st?.conversation || null, // {id, origin:{type}, expiration_timestamp}
+      pricing: st?.pricing || null,         // {billable, category, pricing_model}
+      errors: st?.errors || null,
+      phone_number_id: phoneNumberId,
+      waba_id: wabaId
+    }
+  };
+}
+
 // ========= Fastify =========
 const app = Fastify({
   logger: { level: 'info' },
@@ -336,6 +373,57 @@ app.post('/webhook', async (req, reply) => {
     if (!ok) console.warn('⚠️ Meta assinatura inválida (permitindo)');
   }
 
+  // ========== NOVO: atalho para WhatsApp STATUS ==========
+  if (channel === 'whatsapp' && isWaStatus(req.body)) {
+    try {
+      const statuses = listWaStatuses(req.body);
+      const headersLower = Object.fromEntries(Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
+      const lookupId = extractLookupId(channel, req.body || {}, headersLower); // phone_number_id → resolve tenant
+      const route = await resolveTenantAndQueue({ channel, lookupId });
+      console.log('🛣️ rota (status):', safe(route));
+
+      const chHeadersBase = {
+        'x-channel': channel,
+        'x-external-id': String(lookupId || ''),
+        'x-tenant': String(route.tenant || '')
+      };
+
+      // publica 1 evento por status, com idempotência por status.id
+      for (const st of statuses) {
+        const idemKey = st?.id ? `wa:${st.id}` : crypto.createHash('sha1').update(raw).digest('hex');
+        const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', 300, 'NX');
+        if (wrote !== 'OK') {
+          console.log('♻️ duplicate (status), idemKey=', idemKey);
+          continue;
+        }
+        const evt = buildWaStatusEvent(req.body, st);
+
+        await publishToQueue({
+          queue: route.queue || FALLBACK_QUEUE,
+          body: {
+            ...evt,
+            channel_lookup_external_id: lookupId,
+            tenant: route.tenant || null,
+          },
+          headers: {
+            ...chHeadersBase,
+            'x-idempotency-key': idemKey,
+            'x-wa-status': String(st?.status || ''),
+            'x-wa-mid': String(st?.id || '')
+          }
+        });
+      }
+
+      console.log('🏁 (status) done → 202');
+      return reply.code(202).send({ status: 'accepted' });
+    } catch (e) {
+      console.error('❌ publish (status) falhou:', e?.message);
+      return reply.code(202).send({ status: 'accepted_parking' });
+    }
+  }
+  // ========== FIM do branch de STATUS ==========
+
+  // ===== Fluxo original para mensagens (inalterado) =====
   // idempotência
   let idemKey;
   try {
