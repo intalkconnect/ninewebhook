@@ -1,9 +1,13 @@
 // server.js — Webhook único (Fastify)
-// Roteia fila como <subdomain>.incoming via public.tenant_channel_connections
-// - Prioridade de lookup:
-//   1) tenant_channel_connections(channel, external_id)  // ex.: WhatsApp -> phone_number_id
-//   2) tenant_channel_connections(channel, account_id)   // ex.: WhatsApp -> WABA_ID
-//   3) public.tenants.*_external_id (LEGADO)             // compatibilidade
+// Roteia MENSAGENS para <subdomain>.incoming e STATUS para <subdomain>.status
+// - Resolução de tenant:
+//   1) public.tenant_channel_connections(channel, external_id)    // WhatsApp -> phone_number_id
+//   2) public.tenant_channel_connections(channel, account_id)     // WhatsApp -> WABA_ID
+//   3) public.tenants.*_external_id (LEGADO)
+//
+// ⚠️ Mensagens e Status têm idempotência separada:
+//    - Mensagens: por msg.id (wamid de "messages")
+//    - Status: por (status.id + status + timestamp)
 
 'use strict';
 
@@ -51,10 +55,16 @@ const FALLBACK_QUEUE   = process.env.FALLBACK_QUEUE   || 'hmg.incoming';
 // Template de fila (ex.: "%s.incoming" -> "hmg.incoming")
 const QUEUE_TEMPLATE = process.env.QUEUE_TEMPLATE || '%s.incoming';
 
+// ✅ NOVO: fila de STATUS por tenant (ex.: "%s.status" -> "hmg.status")
+const STATUS_QUEUE_TEMPLATE = process.env.STATUS_QUEUE_TEMPLATE || '%s.status';
+// TTL (segundos) para idempotência de STATUS (WA pode reenviar dentro de ~20min)
+const STATUS_IDEMP_TTL = parseInt(process.env.STATUS_IDEMP_TTL || '3600', 10);
+
 // ========= Utils =========
 const now = () => new Date().toISOString();
 const safe = (o) => { try { return JSON.stringify(o, null, 2); } catch { return '[unserializable]'; } };
 const redact = (u) => String(u || '').replace(/(\/\/[^:]+:)([^@]+)(@)/, '$1***$3');
+const normMsisdn = (s='') => String(s).replace(/\D/g, '');
 
 // ========= Detect/Verify =========
 function detectChannel(body, headers) {
@@ -97,22 +107,19 @@ function extractLookupId(channel, body, headersLower) {
     return null;
   }
   if (channel === 'instagram') {
-    // normalmente é o IG business account id
     return body?.entry?.[0]?.id || null;
   }
   if (channel === 'facebook') {
-    // Messenger: preferir PSID do sender; fallback page id (entry[0].id)
     const msg = body?.entry?.[0]?.messaging?.[0];
     return msg?.sender?.id || body?.entry?.[0]?.id || null;
   }
   if (channel === 'telegram') {
-    // seu header do "bot api secret token"
     return headersLower['x-telegram-bot-api-secret-token'] || null;
   }
   return null;
 }
 
-// ========= Normalização de evento (para payload) =========
+// ========= Normalização de evento (para payload de mensagem) =========
 function normalizeEvent(channel, body) {
   const out = {
     channel,
@@ -143,10 +150,6 @@ function normalizeEvent(channel, body) {
 }
 
 // ========= Roteamento via Postgres/Redis =========
-// Nova ordem de resolução:
-// 1) public.tenant_channel_connections(channel, external_id)
-// 2) public.tenant_channel_connections(channel, account_id)
-// 3) LEGADO: public.tenants.<canal>_external_id
 async function resolveTenantAndQueue({ channel, lookupId }) {
   console.log(`🔎 resolveTenantAndQueue: channel=${channel} lookupId=${lookupId}`);
 
@@ -165,7 +168,7 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
 
   const client = await pool.connect();
   try {
-    // 1) Tenta match direto por external_id (ex.: WhatsApp -> phone_number_id)
+    // 1) Match por external_id (ex.: WhatsApp -> phone_number_id)
     const sqlExternal = `
       SELECT subdomain
         FROM public.tenant_channel_connections
@@ -183,7 +186,7 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
       return res;
     }
 
-    // 2) Fallback: tenta por account_id (ex.: WABA_ID)
+    // 2) Fallback por account_id (ex.: WABA_ID)
     const sqlAccount = `
       SELECT subdomain
         FROM public.tenant_channel_connections
@@ -254,9 +257,7 @@ async function getConfirmChannel(url) {
 async function publishToQueue({ queue, body, headers }) {
   const ch = await getConfirmChannel(DEFAULT_AMQP_URL);
   const payload = Buffer.from(JSON.stringify(body));
-  console.log(`📤 Publicando no Rabbit (default exchange): queue=${queue}
-  headers=${safe(headers)}
-  payload_len=${payload.length}`);
+  console.log(`📤 Publicando (messages) queue=${queue} payload_len=${payload.length}`);
 
   const ok = ch.publish('', queue, payload, {
     persistent: true,
@@ -268,7 +269,64 @@ async function publishToQueue({ queue, body, headers }) {
     await new Promise((res) => ch.once('drain', res));
   }
   await ch.waitForConfirms();
-  console.log('✅ confirmado pelo RabbitMQ');
+  console.log('✅ confirmado pelo RabbitMQ (messages)');
+}
+
+// ✅ NOVO: publisher de STATUS do tenant (fila dedicada)
+async function publishTenantStatus({ tenant, meta, statuses }) {
+  if (!tenant || !Array.isArray(statuses) || !statuses.length) return;
+  const queue = (STATUS_QUEUE_TEMPLATE || '%s.status').replace('%s', tenant);
+
+  const ch = await getConfirmChannel(DEFAULT_AMQP_URL);
+  await ch.assertQueue(queue, { durable: true });
+
+  let published = 0;
+  for (const st of statuses) {
+    const id = st?.id;
+    const s  = String(st?.status || '').toLowerCase();
+    const ts = String(st?.timestamp || '');
+    if (!id || !s || !ts) continue;
+
+    // idempotência por evento (wamid + status + timestamp)
+    const idemKey = `wa:status:${id}:${s}:${ts}`;
+    try {
+      const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', STATUS_IDEMP_TTL, 'NX');
+      if (wrote !== 'OK') {
+        console.log('♻️ duplicate (status), idemKey=', idemKey);
+        continue;
+      }
+    } catch (e) {
+      console.warn('Redis status NX falhou (segue):', e?.message);
+      // mesmo sem cache, seguimos publicando
+    }
+
+    const payload = {
+      kind: 'waba_status',
+      tenant,
+      channel: 'whatsapp',
+      phone_number_id: meta?.phone_number_id,
+      display_phone_number: meta?.display_phone_number,
+      status: {
+        id: id,                                  // wamid
+        status: s,                               // sent|delivered|read|failed
+        timestamp: ts,                           // epoch (string)
+        recipient_msisdn: normMsisdn(st?.recipient_id),
+        conversation: st?.conversation || null,
+        pricing: st?.pricing || null
+      }
+    };
+
+    const ok = ch.publish('', queue, Buffer.from(JSON.stringify(payload)), {
+      persistent: true,
+      contentType: 'application/json',
+      headers: { 'x-tenant': tenant, 'x-kind': 'waba_status' }
+    });
+    if (!ok) await new Promise(res => ch.once('drain', res));
+    published++;
+  }
+
+  await ch.waitForConfirms();
+  console.log(`✅ status publicados: tenant=${tenant} queue=${queue} count=${published}`);
 }
 
 // ========= Fastify =========
@@ -336,18 +394,83 @@ app.post('/webhook', async (req, reply) => {
     if (!ok) console.warn('⚠️ Meta assinatura inválida (permitindo)');
   }
 
-  // idempotência
+  // Resolve tenant/queue pelo external_id do canal
+  const headersLower = Object.fromEntries(Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
+  const lookupId = extractLookupId(channel, req.body || {}, headersLower);
+  const route = await resolveTenantAndQueue({ channel, lookupId });
+  console.log('🛣️ rota:', safe(route));
+  const tenant = route.tenant;
+
+  // ✅ WhatsApp: pode trazer "messages" (conteúdo) e/ou "statuses" (entrega/leitura)
+  if (channel === 'whatsapp') {
+    const val = req.body?.entry?.[0]?.changes?.[0]?.value || {};
+    const meta = val?.metadata || {};
+    const statuses = Array.isArray(val?.statuses) ? val.statuses : [];
+    const messages = Array.isArray(val?.messages) ? val.messages : [];
+
+    // 1) Publique STATUS na fila dedicada do tenant (não interfere na incoming)
+    if (tenant && statuses.length) {
+      try {
+        await publishTenantStatus({ tenant, meta, statuses });
+      } catch (e) {
+        console.error('❌ publish status falhou:', e?.message);
+        // não bloqueia o fluxo; seguimos com mensagens se houver
+      }
+    }
+
+    // 2) Publique MENSAGENS na fila padrão do tenant (incoming)
+    if (messages.length) {
+      // idempotência de MENSAGEM por msg.id
+      const msg = messages[0]; // normalmente vem 1 por webhook
+      let idemKey = '';
+      try {
+        if (msg?.id) idemKey = `wa:msg:${msg.id}`;
+      } catch {}
+      if (!idemKey) {
+        // fallback hash do raw (apenas para evitar reprocesso de pacotes idênticos)
+        idemKey = 'wa:msg:' + crypto.createHash('sha1').update(raw).digest('hex');
+      }
+
+      const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', 300, 'NX');
+      if (wrote !== 'OK') {
+        console.log('♻️ duplicate (message), idemKey=', idemKey);
+        return reply.send({ status: 'duplicate' });
+      }
+
+      const evt = normalizeEvent(channel, req.body || {});
+      try {
+        await publishToQueue({
+          queue: route.queue || FALLBACK_QUEUE,
+          body: {
+            ...evt,
+            channel_lookup_external_id: lookupId,
+            tenant: tenant || null,
+          },
+          headers: {
+            'x-idempotency-key': idemKey,
+            'x-channel': channel,
+            'x-external-id': String(lookupId || ''),
+            'x-tenant': String(tenant || '')
+          }
+        });
+      } catch (e) {
+        console.error('❌ publish mensagem falhou:', e?.message);
+        return reply.code(202).send({ status: 'accepted_parking' });
+      }
+    }
+
+    console.log('🏁 done → 202');
+    return reply.code(202).send({ status: 'accepted' });
+  }
+
+  // Canais não-WA: mantém fluxo antigo (uma única publicação no incoming)
+  // idempotência genérica
   let idemKey;
   try {
-    if (channel === 'whatsapp') {
-      const msgId = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.id
-                 || req.body?.entry?.[0]?.changes?.[0]?.value?.statuses?.[0]?.id;
-      idemKey = msgId ? `wa:${msgId}` : null;
-    } else if (channel === 'telegram') {
+    if (channel === 'telegram') {
       const up = req.body?.update_id;
       idemKey = (up != null) ? `tg:${String(up)}` : null;
     } else {
-      // IG/FB: usa hash do raw
       idemKey = crypto.createHash('sha1').update(raw).digest('hex');
     }
   } catch {}
@@ -358,16 +481,8 @@ app.post('/webhook', async (req, reply) => {
     console.log('♻️ duplicate, idemKey=', idemKey);
     return reply.send({ status: 'duplicate' });
   }
-  console.log('🔑 idempotency:', idemKey);
 
-  // monta evento e resolve TENANT -> QUEUE
   const evt = normalizeEvent(channel, req.body || {});
-  const headersLower = Object.fromEntries(Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
-  const lookupId = extractLookupId(channel, req.body || {}, headersLower);
-
-  const route = await resolveTenantAndQueue({ channel, lookupId });
-  console.log('🛣️ rota:', safe(route));
-
   try {
     await publishToQueue({
       queue: route.queue || FALLBACK_QUEUE,
