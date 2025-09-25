@@ -5,9 +5,7 @@
 //   2) public.tenant_channel_connections(channel, account_id)     // WhatsApp -> WABA_ID
 //   3) public.tenants.*_external_id (LEGADO)
 //
-// ⚠️ Mensagens e Status têm idempotência separada:
-//    - Mensagens: por msg.id (wamid de "messages")
-//    - Status: por (status.id + status + timestamp)
+// ⚠️ Idempotência REMOVIDA (mensagens e status)
 
 'use strict';
 
@@ -16,7 +14,6 @@ const rawBody = require('fastify-raw-body');
 const crypto = require('crypto');
 const amqplib = require('amqplib');
 const pg = require('pg');
-const Redis = require('ioredis');
 
 // ========= ENV =========
 const PORT = Number(process.env.PORT || 3000);
@@ -40,14 +37,6 @@ const pool = new Pool({
   idleTimeoutMillis: 10000
 });
 
-// Redis (idempotência + cache)
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'redis',
-  port: Number(process.env.REDIS_PORT || 6379),
-  lazyConnect: true,
-  retryStrategy: (t) => Math.min(t * 50, 1500),
-});
-
 // Rabbit
 const DEFAULT_AMQP_URL = process.env.DEFAULT_AMQP_URL || 'amqp://guest:guest@rabbitmq:5672/';
 const FALLBACK_QUEUE   = process.env.FALLBACK_QUEUE   || 'hmg.incoming';
@@ -55,16 +44,52 @@ const FALLBACK_QUEUE   = process.env.FALLBACK_QUEUE   || 'hmg.incoming';
 // Template de fila (ex.: "%s.incoming" -> "hmg.incoming")
 const QUEUE_TEMPLATE = process.env.QUEUE_TEMPLATE || '%s.incoming';
 
-// ✅ NOVO: fila de STATUS por tenant (ex.: "%s.status" -> "hmg.status")
+// fila de STATUS por tenant (ex.: "%s.status" -> "hmg.status")
 const STATUS_QUEUE_TEMPLATE = process.env.STATUS_QUEUE_TEMPLATE || '%s.status';
-// TTL (segundos) para idempotência de STATUS (WA pode reenviar dentro de ~20min)
-const STATUS_IDEMP_TTL = parseInt(process.env.STATUS_IDEMP_TTL || '3600', 10);
+
+// Cache de tenant (em memória)
+const TENANT_CACHE_TTL   = parseInt(process.env.TENANT_CACHE_TTL   || '300',  10); // s
 
 // ========= Utils =========
 const now = () => new Date().toISOString();
 const safe = (o) => { try { return JSON.stringify(o, null, 2); } catch { return '[unserializable]'; } };
 const redact = (u) => String(u || '').replace(/(\/\/[^:]+:)([^@]+)(@)/, '$1***$3');
 const normMsisdn = (s='') => String(s).replace(/\D/g, '');
+
+// ========= TTL Cache simples (para resolução de tenant) =========
+class TTLCache {
+  constructor(maxSize = 5000) {
+    this.map = new Map();
+    this.maxSize = maxSize;
+  }
+  _now() { return Date.now(); }
+  get(key) {
+    const it = this.map.get(key);
+    if (!it) return null;
+    if (this._now() > it.expires) {
+      this.map.delete(key);
+      return null;
+    }
+    return it.value;
+  }
+  set(key, ttlSec, value) {
+    this.map.set(key, { value, expires: this._now() + ttlSec * 1000 });
+    this._cleanup();
+  }
+  _cleanup() {
+    if (this.map.size <= this.maxSize) return;
+    const now = this._now();
+    for (const [k, v] of this.map) {
+      if (v.expires <= now) this.map.delete(k);
+      if (this.map.size <= this.maxSize) return;
+    }
+    while (this.map.size > this.maxSize) {
+      const k = this.map.keys().next().value;
+      this.map.delete(k);
+    }
+  }
+}
+const tenantCache = new TTLCache(5000);
 
 // ========= Detect/Verify =========
 function detectChannel(body, headers) {
@@ -93,15 +118,12 @@ function verifyTelegramSecret(tokenHeader) {
 }
 
 // ========= Extração de IDs =========
-// ATENÇÃO: isto define o external_id usado para localizar o tenant
 function extractLookupId(channel, body, headersLower) {
   if (channel === 'whatsapp') {
     const entry  = body?.entry?.[0];
     const change = entry?.changes?.[0]?.value;
-    // 1) preferir phone_number_id (mais granular por número)
     const phoneId = change?.metadata?.phone_number_id;
     if (phoneId) return phoneId;
-    // 2) fallback: WABA_ID
     const wabaId = entry?.id;
     if (wabaId) return wabaId;
     return null;
@@ -119,7 +141,7 @@ function extractLookupId(channel, body, headersLower) {
   return null;
 }
 
-// ========= Normalização de evento (para payload de mensagem) =========
+// ========= Normalização de evento =========
 function normalizeEvent(channel, body) {
   const out = {
     channel,
@@ -149,7 +171,7 @@ function normalizeEvent(channel, body) {
   return out;
 }
 
-// ========= Roteamento via Postgres/Redis =========
+// ========= Roteamento via Postgres (com cache de tenant) =========
 async function resolveTenantAndQueue({ channel, lookupId }) {
   console.log(`🔎 resolveTenantAndQueue: channel=${channel} lookupId=${lookupId}`);
 
@@ -159,16 +181,12 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
   }
 
   const cacheKey = `tenantByExt:${channel}:${lookupId}`;
-  try {
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-  } catch (e) {
-    console.warn('Redis GET falhou (segue sem cache):', e?.message);
-  }
+  const cached = tenantCache.get(cacheKey);
+  if (cached) return cached;
 
   const client = await pool.connect();
   try {
-    // 1) Match por external_id (ex.: WhatsApp -> phone_number_id)
+    // 1) external_id
     const sqlExternal = `
       SELECT subdomain
         FROM public.tenant_channel_connections
@@ -182,11 +200,11 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
       const sd = r.rows[0].subdomain;
       const queue = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
       const res = { queue, source: 'tcc_external', tenant: sd };
-      try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+      tenantCache.set(cacheKey, TENANT_CACHE_TTL, res);
       return res;
     }
 
-    // 2) Fallback por account_id (ex.: WABA_ID)
+    // 2) account_id
     const sqlAccount = `
       SELECT subdomain
         FROM public.tenant_channel_connections
@@ -200,7 +218,7 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
       const sd = r.rows[0].subdomain;
       const queue = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
       const res = { queue, source: 'tcc_account', tenant: sd };
-      try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 300); } catch {}
+      tenantCache.set(cacheKey, TENANT_CACHE_TTL, res);
       return res;
     }
 
@@ -224,12 +242,11 @@ async function resolveTenantAndQueue({ channel, lookupId }) {
         const sd = t.rows[0].subdomain;
         const queue  = (QUEUE_TEMPLATE || '%s.incoming').replace('%s', sd);
         const res = { queue, source: 'tenants_legacy', tenant: sd };
-        try { await redis.set(cacheKey, JSON.stringify(res), 'EX', 120); } catch {}
+        tenantCache.set(cacheKey, Math.min(TENANT_CACHE_TTL, 120), res);
         return res;
       }
     }
 
-    // Fallback final
     return { queue: FALLBACK_QUEUE, source: 'fallback', tenant: null };
   } finally {
     client.release();
@@ -272,7 +289,7 @@ async function publishToQueue({ queue, body, headers }) {
   console.log('✅ confirmado pelo RabbitMQ (messages)');
 }
 
-// ✅ NOVO: publisher de STATUS do tenant (fila dedicada)
+// Publisher de STATUS (sem idempotência)
 async function publishTenantStatus({ tenant, meta, statuses }) {
   if (!tenant || !Array.isArray(statuses) || !statuses.length) return;
   const queue = (STATUS_QUEUE_TEMPLATE || '%s.status').replace('%s', tenant);
@@ -287,19 +304,6 @@ async function publishTenantStatus({ tenant, meta, statuses }) {
     const ts = String(st?.timestamp || '');
     if (!id || !s || !ts) continue;
 
-    // idempotência por evento (wamid + status + timestamp)
-    const idemKey = `wa:status:${id}:${s}:${ts}`;
-    try {
-      const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', STATUS_IDEMP_TTL, 'NX');
-      if (wrote !== 'OK') {
-        console.log('♻️ duplicate (status), idemKey=', idemKey);
-        continue;
-      }
-    } catch (e) {
-      console.warn('Redis status NX falhou (segue):', e?.message);
-      // mesmo sem cache, seguimos publicando
-    }
-
     const payload = {
       kind: 'waba_status',
       tenant,
@@ -307,9 +311,9 @@ async function publishTenantStatus({ tenant, meta, statuses }) {
       phone_number_id: meta?.phone_number_id,
       display_phone_number: meta?.display_phone_number,
       status: {
-        id: id,                                  // wamid
-        status: s,                               // sent|delivered|read|failed
-        timestamp: ts,                           // epoch (string)
+        id: id,
+        status: s,
+        timestamp: ts,
         recipient_msisdn: normMsisdn(st?.recipient_id),
         conversation: st?.conversation || null,
         pricing: st?.pricing || null
@@ -349,7 +353,6 @@ app.get('/healthz', async () => ({ ok: true, ts: now() }));
 app.get('/readyz', async (_req, reply) => {
   try {
     await pool.query('SELECT 1');
-    try { await redis.ping(); } catch (e) { throw new Error('redis: ' + e?.message); }
     const c = await amqplib.connect(DEFAULT_AMQP_URL, { heartbeat: 5 }); await c.close();
     return reply.send({ ready: true, ts: now() });
   } catch (e) {
@@ -401,42 +404,24 @@ app.post('/webhook', async (req, reply) => {
   console.log('🛣️ rota:', safe(route));
   const tenant = route.tenant;
 
-  // ✅ WhatsApp: pode trazer "messages" (conteúdo) e/ou "statuses" (entrega/leitura)
+  // WhatsApp: "messages" e/ou "statuses"
   if (channel === 'whatsapp') {
     const val = req.body?.entry?.[0]?.changes?.[0]?.value || {};
     const meta = val?.metadata || {};
     const statuses = Array.isArray(val?.statuses) ? val.statuses : [];
     const messages = Array.isArray(val?.messages) ? val.messages : [];
 
-    // 1) Publique STATUS na fila dedicada do tenant (não interfere na incoming)
+    // 1) STATUS → fila dedicada (sem idempotência)
     if (tenant && statuses.length) {
       try {
         await publishTenantStatus({ tenant, meta, statuses });
       } catch (e) {
         console.error('❌ publish status falhou:', e?.message);
-        // não bloqueia o fluxo; seguimos com mensagens se houver
       }
     }
 
-    // 2) Publique MENSAGENS na fila padrão do tenant (incoming)
+    // 2) MENSAGENS → fila padrão do tenant (incoming) — sem idempotência
     if (messages.length) {
-      // idempotência de MENSAGEM por msg.id
-      const msg = messages[0]; // normalmente vem 1 por webhook
-      let idemKey = '';
-      try {
-        if (msg?.id) idemKey = `wa:msg:${msg.id}`;
-      } catch {}
-      if (!idemKey) {
-        // fallback hash do raw (apenas para evitar reprocesso de pacotes idênticos)
-        idemKey = 'wa:msg:' + crypto.createHash('sha1').update(raw).digest('hex');
-      }
-
-      const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', 300, 'NX');
-      if (wrote !== 'OK') {
-        console.log('♻️ duplicate (message), idemKey=', idemKey);
-        return reply.send({ status: 'duplicate' });
-      }
-
       const evt = normalizeEvent(channel, req.body || {});
       try {
         await publishToQueue({
@@ -447,7 +432,6 @@ app.post('/webhook', async (req, reply) => {
             tenant: tenant || null,
           },
           headers: {
-            'x-idempotency-key': idemKey,
             'x-channel': channel,
             'x-external-id': String(lookupId || ''),
             'x-tenant': String(tenant || '')
@@ -463,25 +447,7 @@ app.post('/webhook', async (req, reply) => {
     return reply.code(202).send({ status: 'accepted' });
   }
 
-  // Canais não-WA: mantém fluxo antigo (uma única publicação no incoming)
-  // idempotência genérica
-  let idemKey;
-  try {
-    if (channel === 'telegram') {
-      const up = req.body?.update_id;
-      idemKey = (up != null) ? `tg:${String(up)}` : null;
-    } else {
-      idemKey = crypto.createHash('sha1').update(raw).digest('hex');
-    }
-  } catch {}
-  if (!idemKey) idemKey = crypto.createHash('sha1').update(raw).digest('hex');
-
-  const wrote = await redis.set(`idem:${idemKey}`, '1', 'EX', 300, 'NX');
-  if (wrote !== 'OK') {
-    console.log('♻️ duplicate, idemKey=', idemKey);
-    return reply.send({ status: 'duplicate' });
-  }
-
+  // Canais não-WA: fluxo antigo (uma única publicação no incoming) — sem idempotência
   const evt = normalizeEvent(channel, req.body || {});
   try {
     await publishToQueue({
@@ -492,7 +458,6 @@ app.post('/webhook', async (req, reply) => {
         tenant: route.tenant || null,
       },
       headers: {
-        'x-idempotency-key': idemKey,
         'x-channel': channel,
         'x-external-id': String(lookupId || ''),
         'x-tenant': String(route.tenant || '')
@@ -509,7 +474,6 @@ app.post('/webhook', async (req, reply) => {
 
 // boot
 (async () => {
-  try { await redis.connect(); console.log('✅ Redis conectado'); } catch (e) { console.warn('Redis pendente:', e?.message); }
   try { await pool.query('SELECT 1'); console.log('✅ Postgres OK'); } catch (e) { console.warn('Postgres pendente:', e?.message); }
   await app.listen({ port: PORT, host: '0.0.0.0' });
   app.log.info('🚀 Webhook listening on :' + PORT);
@@ -520,7 +484,6 @@ async function shutdown(r) {
   console.log('🛑 shutdown:', r, now());
   try { await app.close(); } catch {}
   try { await pool.end(); } catch {}
-  try { await redis.quit(); } catch {}
   for (const [url, obj] of amqpPool.entries()) {
     try { await obj?.ch?.close(); } catch {}
     try { await obj?.conn?.close(); } catch {}
