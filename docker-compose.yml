@@ -1,9 +1,9 @@
 version: "3.9"
 
 services:
-  app:
+  webhook:
     image: node:20-alpine
-    container_name: webhook-app
+    container_name: channels-webhook
     working_dir: /app
     environment:
       NODE_ENV: production
@@ -12,28 +12,30 @@ services:
       # --- Postgres ---
       PGHOST: postgres
       PGPORT: "5432"
-      PGDATABASE: ninedb
+      PGDATABASE: postgres
       PGUSER: postgres
       PGPASSWORD: "Alice*321"
 
-      # --- Redis ---
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
 
       # --- RabbitMQ ---
       DEFAULT_AMQP_URL: amqp://guest:guest@rabbit:5672/
       FALLBACK_QUEUE: hmg.incoming
+      QUEUE_TEMPLATE: "%s.incoming"
+
 
       # --- Meta/Telegram (opcionais) ---
       META_APP_SECRET: "5daeaff8d0447f7469f854b6082bb2d1"
       META_VERIFY_TOKEN: "meta_verify_82a7f6c9ba"
       TELEGRAM_SECRET: ""
       TELEGRAM_ENDPOINT_ID: "8264496732:AAHNXxzWeLIfYk7nAPFWGVteQLRb9i5yGlc"
+      TELEGRAM_TOKEN: "8264496732:AAHNXxzWeLIfYk7nAPFWGVteQLRb9i5yGlc"
+      WHATSAPP_TOKEN: "EAAJu9LjBChkBOZCEiOebcVRuIxATcMUWCmeMPWTZCCWNuJe4QeddvjAXkXpIHntuZClq7yNxQ0hER2ptQ9HaZCYpZB1gnHzETSe4bnrHzZACAD5MPIwzkAIMyTfkuRE2CnqLgwZBTl3a20g3MHLH51SeeZC6K8UUqZBg2tsKvCQmV8PMuVFjjZAiJWGOnxzFmk8QZDZD"
+
 
     command: >
       sh -lc '
         set -e;
-        apk add --no-cache git;
+        apk add --no-cache git wget;
         cd /; rm -rf /app && mkdir -p /app;
         git clone --depth=1 https://github.com/intalkconnect/testelab.git /app;
         cd /app;
@@ -50,7 +52,7 @@ services:
       '
 
     ports:
-      - "3000:3000"   # para teste; depois pode remover e deixar só via NPM
+      - "3000:3000"
 
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/healthz || exit 1"]
@@ -58,74 +60,19 @@ services:
       timeout: 5s
       retries: 5
 
-    depends_on:
-      - redis
-      - rabbit
-      - postgres
-
     networks:
-      - internal
-      - npm_bridge
-    restart: unless-stopped
+      - nginx-proxy-manager_default
+      - public_network
 
-  redis:
-    image: redis:7-alpine
-    container_name: webhook-redis
-    command: >
-      sh -c "redis-server --appendonly yes --save 60 1000 --maxmemory 256mb --maxmemory-policy allkeys-lru"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    networks: [internal]
-    restart: unless-stopped
-
-  rabbit:
-    image: rabbitmq:3-management-alpine
-    container_name: webhook-rabbit
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    ports:
-      - "5672:5672"     # AMQP
-      - "15672:15672"   # painel RabbitMQ
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks: [internal]
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
-    container_name: webhook-postgres
-    environment:
-      POSTGRES_DB: ninedb
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: "Alice*321"
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ninedb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks: [internal]
     restart: unless-stopped
 
 networks:
-  internal:
-    driver: bridge
-  npm_bridge:
+  nginx-proxy-manager_default:
     external: true
+    name: nginx-proxy-manager_default
+  public_network:
+    external: true
+    name: public_network
 
 volumes:
   redis_data:
