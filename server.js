@@ -443,8 +443,8 @@ app.post('/webhook', async (req, reply) => {
       }
     }
 
-    console.log('🏁 done → 202');
-    return reply.code(202).send({ status: 'accepted' });
+    console.log('🏁 done → 200');
+    return reply.code(200).send({ status: 'accepted' });
   }
 
   // Canais não-WA: fluxo antigo (uma única publicação no incoming) — sem idempotência
@@ -468,8 +468,8 @@ app.post('/webhook', async (req, reply) => {
     return reply.code(202).send({ status: 'accepted_parking' });
   }
 
-  console.log('🏁 done → 202');
-  return reply.code(202).send({ status: 'accepted' });
+  console.log('🏁 done → 200');
+  return reply.code(200).send({ status: 'accepted' });
 });
 
 // boot
