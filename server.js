@@ -132,8 +132,8 @@ function extractLookupId(channel, body, headersLower) {
     return body?.entry?.[0]?.id || null;
   }
   if (channel === 'facebook') {
-    const msg = body?.entry?.[0]?.messaging?.[0];
-    return msg?.sender?.id || body?.entry?.[0]?.id || null;
+    const pageId = body?.entry?.[0]?.id || null;
+    return pageId;
   }
   if (channel === 'telegram') {
     return headersLower['x-telegram-bot-api-secret-token'] || null;
