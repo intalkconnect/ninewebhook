@@ -118,13 +118,14 @@ function verifyTelegramSecret(tokenHeader) {
 }
 
 // ========= Extração de IDs =========
+/** external_id/account_id para resolver TENANT (já existia) */
 function extractLookupId(channel, body, headersLower) {
   if (channel === 'whatsapp') {
     const entry  = body?.entry?.[0];
     const change = entry?.changes?.[0]?.value;
-    const phoneId = change?.metadata?.phone_number_id;
-    if (phoneId) return phoneId;
-    const wabaId = entry?.id;
+    const phoneId = change?.metadata?.phone_number_id || change?.phone_number_id || null;
+    if (phoneId) return phoneId; // preferir phone_number_id
+    const wabaId = entry?.id;    // WABA ID (fallback de resolução de tenant)
     if (wabaId) return wabaId;
     return null;
   }
@@ -141,26 +142,58 @@ function extractLookupId(channel, body, headersLower) {
   return null;
 }
 
+/** channel_key (resource_id) para o bot (NOVO — obrigatório p/ publicar) */
+function extractResourceId(channel, body, headersLower) {
+  if (channel === 'whatsapp') {
+    const val = body?.entry?.[0]?.changes?.[0]?.value || {};
+    return (
+      val?.metadata?.phone_number_id ||
+      val?.phone_number_id ||
+      val?.metadata?.display_phone_number_id ||
+      null
+    );
+  }
+  if (channel === 'facebook') {
+    const m = body?.entry?.[0]?.messaging?.[0];
+    return m?.recipient?.id || null; // page_id
+  }
+  if (channel === 'instagram') {
+    const entry = body?.entry?.[0];
+    const m1 = entry?.messaging?.[0];
+    const v2 = entry?.changes?.[0]?.value;
+    return m1?.recipient?.id || v2?.id || v2?.page?.id || null; // ig user/page id
+  }
+  if (channel === 'telegram') {
+    return headersLower['x-telegram-bot-api-secret-token'] || null; // bot_id/secret token
+  }
+  return null;
+}
+
 // ========= Normalização de evento =========
 function normalizeEvent(channel, body) {
   const out = {
     channel,
     received_at: Date.now(),
     event_type: 'message.received',
-    aggregate_id: null,
+    aggregate_id: null,  // SEMPRE o usuário/contato
     payload: body
   };
 
   try {
     if (channel === 'whatsapp') {
       const change = body?.entry?.[0]?.changes?.[0]?.value;
+      // usuário = msg.from / contacts[0].wa_id
       const msg = change?.messages?.[0];
-      out.aggregate_id = msg?.from || change?.metadata?.phone_number_id || null;
+      out.aggregate_id = msg?.from || change?.contacts?.[0]?.wa_id || null;
     } else if (channel === 'instagram') {
-      out.aggregate_id = String(body?.entry?.[0]?.id ?? 'ig');
+      // como contato, use o "from" quando houver, senão um id genérico do entry
+      const entry = body?.entry?.[0];
+      const v2 = entry?.changes?.[0]?.value;
+      const m1 = entry?.messaging?.[0];
+      out.aggregate_id = (v2?.messages?.[0]?.from) || (m1?.sender?.id) || String(entry?.id ?? 'ig');
     } else if (channel === 'facebook') {
       const m = body?.entry?.[0]?.messaging?.[0];
-      out.aggregate_id = m?.sender?.id ?? null;
+      out.aggregate_id = m?.sender?.id ?? null; // PSID
     } else if (channel === 'telegram') {
       const m = body?.message || body?.edited_message || {};
       out.aggregate_id = m?.chat?.id != null ? String(m.chat.id) : null;
@@ -397,21 +430,29 @@ app.post('/webhook', async (req, reply) => {
     if (!ok) console.warn('⚠️ Meta assinatura inválida (permitindo)');
   }
 
-  // Resolve tenant/queue pelo external_id do canal
   const headersLower = Object.fromEntries(Object.entries(req.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
+
+  // 1) Resolve tenant/queue pelo external_id do canal (já existente)
   const lookupId = extractLookupId(channel, req.body || {}, headersLower);
   const route = await resolveTenantAndQueue({ channel, lookupId });
   console.log('🛣️ rota:', safe(route));
   const tenant = route.tenant;
 
-  // WhatsApp: "messages" e/ou "statuses"
+  // 2) Extrai o resource_id (channel_key) — obrigatório para publicar
+  const resourceId = extractResourceId(channel, req.body || {}, headersLower);
+  console.log('🔑 resource_id (channel_key):', resourceId);
+
+  // 3) Normaliza o evento (com aggregate_id = usuário SEMPRE)
+  const baseEvt = normalizeEvent(channel, req.body || {});
+
+  // 4) WhatsApp: "messages" e/ou "statuses"
   if (channel === 'whatsapp') {
     const val = req.body?.entry?.[0]?.changes?.[0]?.value || {};
     const meta = val?.metadata || {};
     const statuses = Array.isArray(val?.statuses) ? val.statuses : [];
     const messages = Array.isArray(val?.messages) ? val.messages : [];
 
-    // 1) STATUS → fila dedicada (sem idempotência)
+    // STATUS → fila dedicada (sem idempotência)
     if (tenant && statuses.length) {
       try {
         await publishTenantStatus({ tenant, meta, statuses });
@@ -420,21 +461,28 @@ app.post('/webhook', async (req, reply) => {
       }
     }
 
-    // 2) MENSAGENS → fila padrão do tenant (incoming) — sem idempotência
+    // MENSAGENS → publicar apenas se tiver resource_id (sem fallback)
     if (messages.length) {
-      const evt = normalizeEvent(channel, req.body || {});
+      if (!resourceId) {
+        console.warn('[webhook] WhatsApp: sem resource_id (phone_number_id) — NÃO publicar');
+        return reply.code(202).send({ status: 'accepted_noop', reason: 'no_channel_key' });
+      }
       try {
         await publishToQueue({
           queue: route.queue || FALLBACK_QUEUE,
           body: {
-            ...evt,
-            channel_lookup_external_id: lookupId,
-            tenant: tenant || null,
+            ...baseEvt,
+            id: `webhook:${crypto.randomUUID()}`,
+            tenant_id: tenant || null,
+            resource_id: resourceId,           // <- NOVO
+            meta: { channel_key: resourceId }, // <- NOVO
+            channel_lookup_external_id: lookupId
           },
           headers: {
             'x-channel': channel,
             'x-external-id': String(lookupId || ''),
-            'x-tenant': String(tenant || '')
+            'x-tenant': String(tenant || ''),
+            'x-channel-key': String(resourceId)
           }
         });
       } catch (e) {
@@ -447,20 +495,30 @@ app.post('/webhook', async (req, reply) => {
     return reply.code(200).send({ status: 'accepted' });
   }
 
-  // Canais não-WA: fluxo antigo (uma única publicação no incoming) — sem idempotência
-  const evt = normalizeEvent(channel, req.body || {});
+  // Canais não-WA: publicar somente se tiver resource_id (sem fallback)
+  if (!resourceId) {
+    console.warn(`[webhook] ${channel}: sem resource_id (channel_key) — NÃO publicar`);
+    return reply.code(202).send({ status: 'accepted_noop', reason: 'no_channel_key' });
+  }
+
+  const evt = {
+    ...baseEvt,
+    id: `webhook:${crypto.randomUUID()}`,
+    tenant_id: route.tenant || null,
+    resource_id: resourceId,           // <- NOVO
+    meta: { channel_key: resourceId }, // <- NOVO
+    channel_lookup_external_id: lookupId
+  };
+
   try {
     await publishToQueue({
       queue: route.queue || FALLBACK_QUEUE,
-      body: {
-        ...evt,
-        channel_lookup_external_id: lookupId,
-        tenant: route.tenant || null,
-      },
+      body: evt,
       headers: {
         'x-channel': channel,
         'x-external-id': String(lookupId || ''),
-        'x-tenant': String(route.tenant || '')
+        'x-tenant': String(route.tenant || ''),
+        'x-channel-key': String(resourceId)
       }
     });
   } catch (e) {
